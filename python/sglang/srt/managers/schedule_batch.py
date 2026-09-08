@@ -1126,12 +1126,11 @@ class Req(ReqDllmMixin):
         self.storage_prefetch_retry_pending = False
         self.storage_prefetch_retry_wait_polls = 0
         self.storage_prefetch_retry_attempts = 0
-        # The node to lock until for swa radix tree lock ref
-        self.swa_uuid_for_lock: Optional[int] = None
+        # Receipt of the tree lock held on last_node (anchor, SWA boundary,
+        # skipped components); every release replays it unchanged.
+        self.lock_receipt: DecLockRefParams = DecLockRefParams()
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
-        # Receipt bit for the single-node Mamba lock.
-        self.mamba_lock_acquired: bool = False
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1820,10 +1819,9 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.kv.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
-        self.swa_uuid_for_lock = None
+        self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
         self.swa_branching_seqlen = None
-        self.mamba_lock_acquired = False
         self.extend_range = None
         self.dllm_initialized = False
         self.is_retracted = True
@@ -3672,16 +3670,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if (
                         release_leaf_lock
                         and not req.swa_prefix_lock_released
-                        and req.swa_uuid_for_lock is not None
+                        and req.lock_receipt.swa_uuid_for_lock is not None
                         and req.last_node is not None
                         and req.decode_batch_idx >= sliding_window_size
                     ):
                         self.tree_cache.dec_swa_lock_only(
-                            req.last_node,
-                            DecLockRefParams(
-                                swa_uuid_for_lock=req.swa_uuid_for_lock,
-                                mamba_lock_acquired=req.mamba_lock_acquired,
-                            ),
+                            req.last_node, req.lock_receipt
                         )
                         req.swa_prefix_lock_released = True
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():

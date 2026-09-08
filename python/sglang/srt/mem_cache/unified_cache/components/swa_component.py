@@ -819,15 +819,13 @@ class SWAComponent(TreeComponent):
     def release_component_lock(
         self,
         node: UnifiedTreeNode,
-        params: Optional[DecLockRefParams],
+        params: DecLockRefParams,
         lock_host: bool = False,
     ) -> None:
         ct = self.component_type
         root = self.tree_core.root_node
         swa_uuid_for_lock = (
-            (params.swa_uuid_for_host_lock if lock_host else params.swa_uuid_for_lock)
-            if params
-            else None
+            params.swa_uuid_for_host_lock if lock_host else params.swa_uuid_for_lock
         )
         dec_swa = True
         uuid_key = "host_uuid" if lock_host else "uuid"
@@ -857,6 +855,11 @@ class SWAComponent(TreeComponent):
                 comp.host_lock_ref = ref - 1
             else:
                 comp.lock_ref = ref - 1
+            if ref == 1:
+                # This may have been the last lock holding the node out of
+                # the evictable-leaf sets; refresh it here rather than rely
+                # on the Full walk running after this one.
+                self.tree_core._update_evictable_leaf_sets(cur)
             if swa_uuid_for_lock and comp.metadata.get(uuid_key) == swa_uuid_for_lock:
                 dec_swa = False
             cur = cur.parent
@@ -887,10 +890,12 @@ class SWAComponent(TreeComponent):
                 f"SWA window release hit lock_ref=0 on node {cur.id}"
             )
             cd.lock_ref -= 1
+            if cd.lock_ref == 0:
+                self.tree_core._update_evictable_leaf_sets(cur)
             if cd.lock_ref == 0 and cd.value is not None:
-                key_len = len(cd.value)
-                self.tree_core.component_protected_size_[ct] -= key_len
-                self.tree_core.component_evictable_size_[ct] += key_len
+                value_len = len(cd.value)
+                self.tree_core.component_protected_size_[ct] -= value_len
+                self.tree_core.component_evictable_size_[ct] += value_len
                 if self.tree_core._is_device_leaf(cur):
                     self.tree_core._evict_component_and_detach_lru(
                         cur,

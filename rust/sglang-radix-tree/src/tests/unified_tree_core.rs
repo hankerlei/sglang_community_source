@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use tch::Tensor;
 
 use super::*;
-use crate::components::{FULL, MAMBA, SWA};
+use crate::components::{ComponentSet, FULL, MAMBA, SWA};
 use crate::node::ValueSlotIdx;
 use crate::test_utils::{accumulate_step, action_kinds};
 
@@ -91,7 +91,7 @@ impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
         _node_id: NodeIdx_,
-        _params: Option<&DecLockRefParams>,
+        _params: &DecLockRefParams,
         _lock_host: bool,
     ) {
         unimplemented!()
@@ -213,7 +213,7 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
         _node_id: NodeIdx_,
-        _params: Option<&DecLockRefParams>,
+        _params: &DecLockRefParams,
         _lock_host: bool,
     ) {
         unimplemented!()
@@ -293,11 +293,11 @@ impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
         _node_id: NodeIdx_,
-        params: Option<&DecLockRefParams>,
+        params: &DecLockRefParams,
         lock_host: bool,
     ) {
         assert!(!lock_host);
-        assert!(params.is_some_and(|p| p.swa_uuid_for_lock.is_some()));
+        assert!(params.swa_uuid_for_lock.is_some());
         panic!("low-priority release dispatched");
     }
 }
@@ -368,7 +368,7 @@ impl TreeComponent<Vec<i64>> for SwaComponentForTest {
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
         _node_id: NodeIdx_,
-        _params: Option<&DecLockRefParams>,
+        _params: &DecLockRefParams,
         _lock_host: bool,
     ) {
         unimplemented!()
@@ -481,7 +481,7 @@ impl TreeComponent<Vec<i64>> for SwaEvictionComponentForTest {
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
         _node_id: NodeIdx_,
-        _params: Option<&DecLockRefParams>,
+        _params: &DecLockRefParams,
         _lock_host: bool,
     ) {
         unimplemented!()
@@ -503,7 +503,7 @@ fn locked_anchor_for_dispatch(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeIdx_ {
     tc.arena
         .set_device_value(n1, FULL, Tensor::from_slice(&[0i64, 1]));
     tc.component_state_mut(FULL).evictable_size = 2;
-    tc.inc_lock_ref(tc.arena.node(n1).id, true);
+    tc.inc_lock_ref(tc.arena.node(n1).id, ComponentSet::EMPTY);
     n1
 }
 
@@ -517,7 +517,7 @@ fn dec_lock_ref_skip_swa_skips_the_swa_component() {
         tc.arena.node(n1).id,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ true,
@@ -543,7 +543,7 @@ fn inc_lock_ref_reaches_every_component() {
     tc.arena
         .set_device_value(n1, FULL, Tensor::from_slice(&[0i64, 1]));
     tc.component_state_mut(FULL).evictable_size = 2;
-    tc.inc_lock_ref(tc.arena.node(n1).id, true);
+    tc.inc_lock_ref(tc.arena.node(n1).id, ComponentSet::EMPTY);
 }
 
 #[test]
@@ -556,7 +556,7 @@ fn dec_lock_ref_without_skip_swa_reaches_every_component() {
         tc.arena.node(n1).id,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ false,
@@ -636,7 +636,7 @@ fn dec_swa_lock_only_dispatches_lower_priority_releases() {
         tc.arena.node(root).id,
         &DecLockRefParams {
             swa_uuid_for_lock: Some(7),
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         &mut device_frees,
@@ -680,7 +680,7 @@ fn dec_swa_lock_only_returns_device_frees_in_the_device_dict() {
         tc.arena.node(a).id,
         &DecLockRefParams {
             swa_uuid_for_lock: result.swa_uuid_for_lock,
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         &mut device_frees,
@@ -3583,12 +3583,12 @@ fn commit_load_back_reattaches_device_slices_and_restores_the_match() {
     assert_eq!(tc.full_evictable_size(), 4);
     // The orchestrator re-locks the loaded path right after commit; that lock walk
     // also re-evaluates the parent's transient D-leaf membership.
-    tc.inc_lock_ref(tc.arena.node(child).id, true);
+    tc.inc_lock_ref(tc.arena.node(child).id, ComponentSet::EMPTY);
     tc.dec_lock_ref(
         tc.arena.node(child).id,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ false,
@@ -5007,7 +5007,7 @@ fn stale_handle_panics_after_its_node_is_freed() {
     tc.insert(&insert_params(&vec![4], &[13]));
     let leaf = tc.match_prefix(&match_params(&vec![4])).best_match_node_id;
     tc.evict_device_leaf(leaf, /* is_write_back = */ false);
-    tc.inc_lock_ref(leaf, true);
+    tc.inc_lock_ref(leaf, ComponentSet::EMPTY);
 }
 
 #[test]
@@ -5885,7 +5885,7 @@ fn reset_restores_a_fresh_tree() {
         ..insert_params(&vec![7, 8], &[20, 21])
     });
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3]));
-    tc.inc_lock_ref(matched.best_match_node_id, true);
+    tc.inc_lock_ref(matched.best_match_node_id, ComponentSet::EMPTY);
     assert_eq!(tc.protected_size(), 3);
     // Seed aux LRU, host LRU, and host-leaf state so the reset must clear each.
     let root = tc.arena.root();
@@ -5936,7 +5936,7 @@ fn size_accessors_mirror_the_full_component_state() {
     assert_eq!(tc.protected_size(), 0);
     assert_eq!(tc.component_evictable_size(FULL), 3);
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3]));
-    tc.inc_lock_ref(matched.best_match_node_id, true);
+    tc.inc_lock_ref(matched.best_match_node_id, ComponentSet::EMPTY);
     assert_eq!(tc.protected_size(), 3);
     assert_eq!(tc.full_protected_size(), 3);
     assert_eq!(tc.evictable_size(), 0);
@@ -6025,7 +6025,7 @@ fn walk_for_kv_canary_chains_slots_across_namespaces() {
 fn walk_for_kv_canary_unlocked_only_skips_locked_nodes_but_keeps_the_chain() {
     let mut tc = core();
     let (a, _b) = matched_chain(&mut tc);
-    tc.inc_lock_ref(tc.arena.node(a).id, true);
+    tc.inc_lock_ref(tc.arena.node(a).id, ComponentSet::EMPTY);
     assert_eq!(
         sorted_canary_rows(tc.walk_for_kv_canary(true, false)),
         vec![(12, 2, 11)]
@@ -6353,13 +6353,13 @@ fn sanity_check_passes_on_a_healthy_tree() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2, 9]))
         .best_match_node_id;
-    tc.inc_lock_ref(leaf, true);
+    tc.inc_lock_ref(leaf, ComponentSet::EMPTY);
     tc.sanity_check(&[(1, leaf)], &[(2, leaf)]);
     tc.dec_lock_ref(
         tc.arena.node(tc.arena.resolve(leaf)).id,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ false,
@@ -6477,7 +6477,7 @@ fn sanity_check_accepts_a_locked_tombstone() {
     tc.update_evictable_leaf_sets_(leaf_idx);
     let parent_idx = tc.arena.node(leaf_idx).parent();
     tc.update_evictable_leaf_sets_(parent_idx);
-    tc.inc_lock_ref(leaf, true);
+    tc.inc_lock_ref(leaf, ComponentSet::EMPTY);
     assert_eq!(tc.arena.device_lock_ref(leaf_idx, FULL), 1);
     tc.sanity_check(&[], &[]);
 }
@@ -7644,11 +7644,12 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
             2 => {
                 // Balanced lock round trip on whatever the key matches.
                 let anchor = tc.match_prefix(&match_params(&key)).best_match_node_id;
-                let lock = tc.inc_lock_ref(anchor, true);
+                let lock = tc.inc_lock_ref(anchor, ComponentSet::EMPTY);
                 let params = DecLockRefParams {
+                    node_id: None,
                     swa_uuid_for_lock: lock.swa_uuid_for_lock,
                     swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
-                    mamba_lock_acquired: lock.mamba_lock_acquired,
+                    skipped_lock_components: lock.skipped_lock_components,
                 };
                 tc.dec_lock_ref(anchor, &params, /* skip_swa = */ false);
             }
@@ -7657,7 +7658,7 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
                 let matched = tc.match_prefix(&match_params(&key));
                 let anchor = matched.best_match_node_id;
                 let matched_len = matched.device_indices.numel() as usize;
-                let lock = tc.inc_lock_ref(anchor, true);
+                let lock = tc.inc_lock_ref(anchor, ComponentSet::EMPTY);
                 tc.insert(&sequence_insert_params(
                     &key,
                     matched_len,
@@ -7666,9 +7667,10 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
                     mamba,
                 ));
                 let params = DecLockRefParams {
+                    node_id: None,
                     swa_uuid_for_lock: lock.swa_uuid_for_lock,
                     swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
-                    mamba_lock_acquired: lock.mamba_lock_acquired,
+                    skipped_lock_components: lock.skipped_lock_components,
                 };
                 tc.dec_lock_ref(anchor, &params, /* skip_swa = */ false);
             }
@@ -7814,13 +7816,13 @@ fn a_zero_length_match_anchors_at_the_root() {
         .best_match_node_id;
     assert_eq!(anchor, tc.root_node_handle(Some("salted")));
     // The root handle stays valid across a full namespace eviction.
-    tc.inc_lock_ref(anchor, true);
+    tc.inc_lock_ref(anchor, ComponentSet::EMPTY);
     drain_full_device(&mut tc);
     tc.dec_lock_ref(
         anchor,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ false,

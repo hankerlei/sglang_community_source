@@ -501,9 +501,7 @@ class SWARadixCache(BasePrefixCache):
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
-            skip_swa=req.swa_prefix_lock_released,
+            req.last_node, req.lock_receipt, skip_swa=req.swa_prefix_lock_released
         )
         req.swa_prefix_lock_released = False
 
@@ -563,13 +561,10 @@ class SWARadixCache(BasePrefixCache):
         req.kv.cache_protected_len = len(new_indices)
 
         self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
-            skip_swa=req.swa_prefix_lock_released,
+            req.last_node, req.lock_receipt, skip_swa=req.swa_prefix_lock_released
         )
         req.swa_prefix_lock_released = False
-        result = self.inc_lock_ref(new_last_node)
-        swa_uuid_for_lock = result.swa_uuid_for_lock
+        lock_receipt = self.inc_lock_ref(new_last_node).to_dec_params()
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         if len(new_indices) < len(kv_indices):
@@ -579,7 +574,7 @@ class SWARadixCache(BasePrefixCache):
         else:
             req.prefix_indices = new_indices
         req.last_node = new_last_node
-        req.swa_uuid_for_lock = swa_uuid_for_lock
+        req.lock_receipt = lock_receipt
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)

@@ -618,18 +618,57 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._node_arena.pop(node.id, None)
 
     def inc_lock_ref(
-        self, node_id: NodeId, lock_mamba: bool = True
+        self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
     ) -> IncLockRefResult:
         node = self.node_by_id(node_id)
-        result = IncLockRefResult()
-        # The result records what was locked; the paired dec mirrors it.
-        result.mamba_lock_acquired = lock_mamba
+        skipped = tuple(skip_lock_components)
+        # The receipt records the anchor and what was locked; the paired dec
+        # replays exactly that.
+        result = IncLockRefResult(node_id=node.id, skipped_lock_components=skipped)
         for component in self.components:
-            if not lock_mamba and component.component_type == ComponentType.MAMBA:
+            if component.component_type in skipped:
                 continue
             result = component.acquire_component_lock(node=node, result=result)
         self._update_evictable_leaf_sets(node)
         return result
+
+    @staticmethod
+    def _assert_receipt_anchor(node: UnifiedTreeNode, params: DecLockRefParams) -> None:
+        """A receipt releases only the node its acquire returned; a mispaired
+        node would silently release (or steal) another holder's segment."""
+        assert params.node_id is None or params.node_id == node.id, (
+            f"lock receipt anchored on node {params.node_id} released on node {node.id}"
+        )
+
+    def _release_components(
+        self,
+        node: UnifiedTreeNode,
+        params: DecLockRefParams,
+        *,
+        lock_host: bool = False,
+        skip_swa_and_below: bool = False,
+    ) -> None:
+        """Release each component this receipt acquired. Auxiliaries go first
+        so Full, whose walk refreshes leaf membership on every node it
+        unlocks, sees their final refs; the auxiliary walks also refresh the
+        nodes they unlock, so the order is not load-bearing for the sets."""
+        swa_priority = None
+        if skip_swa_and_below:
+            swa_component = self.components_by_type.get(ComponentType.SWA)
+            if swa_component is not None:
+                swa_priority = swa_component.eviction_priority(is_leaf=False)
+        for component in reversed(self.components):
+            ct = component.component_type
+            if ct in params.skipped_lock_components:
+                continue
+            if swa_priority is not None and (
+                ct == ComponentType.SWA
+                or component.eviction_priority(is_leaf=False) < swa_priority
+            ):
+                continue
+            component.release_component_lock(
+                node=node, params=params, lock_host=lock_host
+            )
 
     def dec_lock_ref(
         self,
@@ -638,24 +677,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         skip_swa: bool = False,
     ) -> DecLockRefResult:
         node = self.node_by_id(node_id)
-        mamba_lock_acquired = params.mamba_lock_acquired
-        # SWA early release also releases lower-priority components.
-        swa_priority = None
-        if skip_swa:
-            swa_component = self.components_by_type.get(ComponentType.SWA)
-            if swa_component is not None:
-                swa_priority = swa_component.eviction_priority(is_leaf=False)
-        # Release auxiliaries before Full refreshes leaf membership.
-        for component in reversed(self.components):
-            ct = component.component_type
-            if swa_priority is not None and (
-                ct == ComponentType.SWA
-                or component.eviction_priority(is_leaf=False) < swa_priority
-            ):
-                continue
-            if not mamba_lock_acquired and ct == ComponentType.MAMBA:
-                continue
-            component.release_component_lock(node=node, params=params)
+        self._assert_receipt_anchor(node, params)
+        # After an SWA early release (dec_swa_lock_only), SWA and the
+        # lower-priority components it dropped are already released.
+        self._release_components(node, params, skip_swa_and_below=skip_swa)
         self._update_evictable_leaf_sets(node)
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
@@ -669,6 +694,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         strictly-lower-priority locks (e.g. Mamba) co-located on the node."""
         result = DecSwaLockOnlyResult()
         node = self.node_by_id(node_id)
+        self._assert_receipt_anchor(node, params)
         swa_component = self.components_by_type.get(ComponentType.SWA)
         if swa_component is None:
             return result
@@ -676,15 +702,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node, params.swa_uuid_for_lock, result.device_frees, result.host_frees
         )
 
-        # Drop strictly-lower-priority locks (e.g. Mamba) co-located on the
-        # node, skipping any the paired inc never took (matters for
-        # FULL+SWA+MAMBA models, e.g. Inkling).
+        # Drop strictly-lower-priority locks co-located on the node, skipping
+        # any the paired inc never took (matters for FULL+SWA+MAMBA models).
         swa_priority = swa_component.eviction_priority(is_leaf=False)
-        for comp in self.components:
-            if (
-                not params.mamba_lock_acquired
-                and comp.component_type == ComponentType.MAMBA
-            ):
+        for comp in reversed(self.components):
+            if comp.component_type in params.skipped_lock_components:
                 continue
             if comp.eviction_priority(is_leaf=False) < swa_priority:
                 comp.release_component_lock(node, params)
@@ -692,7 +714,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         node = self.node_by_id(node_id)
-        result = IncLockRefResult()
+        result = IncLockRefResult(node_id=node.id)
         for component in self.components:
             result = component.acquire_component_lock(
                 node=node, result=result, lock_host=True
@@ -704,8 +726,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
         node = self.node_by_id(node_id)
-        for component in reversed(self.components):
-            component.release_component_lock(node=node, params=params, lock_host=True)
+        self._assert_receipt_anchor(node, params)
+        self._release_components(node, params, lock_host=True)
         self._update_evictable_leaf_sets(node)
         return DecLockRefResult()
 

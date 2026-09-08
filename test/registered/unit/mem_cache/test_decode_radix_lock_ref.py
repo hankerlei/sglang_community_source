@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.utils.common import Range
 
 
@@ -390,8 +391,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.last_node = object()
         req.finished_reason = None
         req.kv.cache_protected_len = 0
-        req.swa_uuid_for_lock = 123
-        req.mamba_lock_acquired = True
+        req.lock_receipt = DecLockRefParams(swa_uuid_for_lock=123)
         req.swa_prefix_lock_released = False
         req.pd_rebootstrap_in_progress = False
         req.sampling_params.max_new_tokens = 16
@@ -468,11 +468,11 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue._pre_alloc.assert_not_called()
         queue.tree_cache.dec_swa_lock_only.assert_called_once_with(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=123, mamba_lock_acquired=True),
+            DecLockRefParams(swa_uuid_for_lock=123),
         )
         queue.tree_cache.dec_lock_ref.assert_called_once_with(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=123, mamba_lock_acquired=True),
+            DecLockRefParams(swa_uuid_for_lock=123),
             skip_swa=True,
         )
         self.assertFalse(req.swa_prefix_lock_released)
@@ -491,8 +491,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
 
         req = MagicMock()
         req.req_pool_idx = 0
-        req.swa_uuid_for_lock = 123
-        req.mamba_lock_acquired = True
+        req.lock_receipt = DecLockRefParams(swa_uuid_for_lock=123)
         req.swa_prefix_lock_released = True  # SWA tail-prealloc released early
 
         prealloc_node = object()
@@ -506,8 +505,8 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             last_device_node=prealloc_node,
         )
         decode_req.hicache_restored_node = restored_node
-        decode_req.hicache_restored_lock_params = DecLockRefParams(
-            swa_uuid_for_lock=456, mamba_lock_acquired=False
+        decode_req.hicache_restore_lock_receipt = DecLockRefParams(
+            swa_uuid_for_lock=456, skipped_lock_components=(ComponentType.MAMBA,)
         )
         decode_req.hicache_restored_kv_indices = torch.arange(4, 8, dtype=torch.int64)
 
@@ -515,15 +514,15 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
 
         q.tree_cache.dec_lock_ref.assert_called_once_with(
             prealloc_node,
-            DecLockRefParams(swa_uuid_for_lock=123, mamba_lock_acquired=True),
+            DecLockRefParams(swa_uuid_for_lock=123),
             skip_swa=True,
         )
         self.assertIs(req.last_node, restored_node)
-        self.assertEqual(req.swa_uuid_for_lock, 456)
-        self.assertFalse(req.mamba_lock_acquired)
+        self.assertEqual(req.lock_receipt.swa_uuid_for_lock, 456)
+        self.assertIn(ComponentType.MAMBA, req.lock_receipt.skipped_lock_components)
         self.assertFalse(req.swa_prefix_lock_released)
         self.assertIsNone(decode_req.hicache_restored_node)
-        self.assertIsNone(decode_req.hicache_restored_lock_params)
+        self.assertIsNone(decode_req.hicache_restore_lock_receipt)
 
     def test_repeated_incremental_no_leak(self):
         """Multiple incremental transfers shouldn't leak lock_refs."""

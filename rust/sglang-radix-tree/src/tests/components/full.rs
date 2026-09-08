@@ -1,5 +1,5 @@
 use super::*;
-use crate::components::FULL;
+use crate::components::{ComponentSet, FULL};
 use crate::test_utils::accumulate_step;
 use crate::unified_tree_core::CacheInitParams;
 
@@ -610,7 +610,7 @@ fn lock_chain(tc: &mut UnifiedTreeCore<Vec<i64>>) -> (NodeIdx_, NodeIdx_) {
 fn inc_lock_ref_locks_the_device_path() {
     let mut tc = core();
     let (n1, n2) = lock_chain(&mut tc);
-    let result = tc.inc_lock_ref(tc.arena.node(n2).id, true);
+    let result = tc.inc_lock_ref(tc.arena.node(n2).id, ComponentSet::EMPTY);
     assert_eq!(result.delta, Some(5));
     assert_eq!(tc.arena.device_lock_ref(n1, FULL), 1);
     assert_eq!(tc.arena.device_lock_ref(n2, FULL), 1);
@@ -624,8 +624,8 @@ fn inc_lock_ref_locks_the_device_path() {
 fn inc_lock_ref_again_only_bumps_the_refs() {
     let mut tc = core();
     let (n1, n2) = lock_chain(&mut tc);
-    tc.inc_lock_ref(tc.arena.node(n2).id, true);
-    let result = tc.inc_lock_ref(tc.arena.node(n2).id, true);
+    tc.inc_lock_ref(tc.arena.node(n2).id, ComponentSet::EMPTY);
+    let result = tc.inc_lock_ref(tc.arena.node(n2).id, ComponentSet::EMPTY);
     assert_eq!(result.delta, Some(0));
     assert_eq!(tc.arena.device_lock_ref(n1, FULL), 2);
     assert_eq!(tc.arena.device_lock_ref(n2, FULL), 2);
@@ -639,8 +639,8 @@ fn inc_lock_ref_counts_only_newly_locked_nodes() {
     // n1 is already locked via its own path; locking n2 moves only n2's tokens.
     let mut tc = core();
     let (n1, n2) = lock_chain(&mut tc);
-    tc.inc_lock_ref(tc.arena.node(n1).id, true);
-    let result = tc.inc_lock_ref(tc.arena.node(n2).id, true);
+    tc.inc_lock_ref(tc.arena.node(n1).id, ComponentSet::EMPTY);
+    let result = tc.inc_lock_ref(tc.arena.node(n2).id, ComponentSet::EMPTY);
     assert_eq!(result.delta, Some(3));
     assert_eq!(tc.arena.device_lock_ref(n1, FULL), 2);
     assert_eq!(tc.arena.device_lock_ref(n2, FULL), 1);
@@ -686,7 +686,7 @@ fn inc_lock_ref_counts_the_evicted_bottom_segment() {
         .set_device_value(n1, FULL, Tensor::from_slice(&[0i64, 1]));
     tc.component_state_mut(FULL).evictable_size = 2;
     tc.evictable_device_leaves.add(n1);
-    let result = tc.inc_lock_ref(tc.arena.node(n3).id, true);
+    let result = tc.inc_lock_ref(tc.arena.node(n3).id, ComponentSet::EMPTY);
     assert_eq!(result.delta, Some(2));
     assert_eq!(tc.arena.device_lock_ref(n1, FULL), 1);
     assert_eq!(tc.arena.device_lock_ref(n2, FULL), 1);
@@ -699,7 +699,7 @@ fn inc_lock_ref_counts_the_evicted_bottom_segment() {
 fn lock_round_trips_on_a_root_anchor_are_noops() {
     let mut tc = core();
     let root = tc.arena.root();
-    let result = tc.inc_lock_ref(tc.arena.node(root).id, true);
+    let result = tc.inc_lock_ref(tc.arena.node(root).id, ComponentSet::EMPTY);
     assert_eq!(result.delta, Some(0));
     // The protected root keeps its construction-time lock through the pair.
     assert_eq!(tc.arena.device_lock_ref(root, FULL), 1);
@@ -707,7 +707,7 @@ fn lock_round_trips_on_a_root_anchor_are_noops() {
         tc.arena.node(root).id,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ false,
@@ -731,7 +731,7 @@ fn lock_walks_stop_at_the_root_of_a_salted_chain() {
     tc.arena
         .set_device_value(n1, FULL, Tensor::from_slice(&[0i64, 1]));
     tc.component_state_mut(FULL).evictable_size = 2;
-    let result = tc.inc_lock_ref(tc.arena.node(n1).id, true);
+    let result = tc.inc_lock_ref(tc.arena.node(n1).id, ComponentSet::EMPTY);
     assert_eq!(result.delta, Some(2));
     assert_eq!(tc.arena.device_lock_ref(n1, FULL), 1);
     // The root keeps its construction-time lock untouched.
@@ -741,7 +741,7 @@ fn lock_walks_stop_at_the_root_of_a_salted_chain() {
         tc.arena.node(n1).id,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ false,
@@ -770,7 +770,7 @@ fn lock_walks_treat_a_present_but_empty_value_as_device_on() {
         ValueSlotIdx::device(FULL),
         Tensor::from_slice(&empty),
     );
-    let result = tc.inc_lock_ref(tc.arena.node(n1).id, true);
+    let result = tc.inc_lock_ref(tc.arena.node(n1).id, ComponentSet::EMPTY);
     // A present-but-empty value is device-on (Python `value is not None`):
     // locked, zero tokens moved.
     assert_eq!(result.delta, Some(0));
@@ -780,7 +780,7 @@ fn lock_walks_treat_a_present_but_empty_value_as_device_on() {
         tc.arena.node(n1).id,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ false,
@@ -795,12 +795,12 @@ fn lock_walks_treat_a_present_but_empty_value_as_device_on() {
 fn dec_lock_ref_unlocks_and_restores_sizes() {
     let mut tc = core();
     let (n1, n2) = lock_chain(&mut tc);
-    tc.inc_lock_ref(tc.arena.node(n2).id, true);
+    tc.inc_lock_ref(tc.arena.node(n2).id, ComponentSet::EMPTY);
     tc.dec_lock_ref(
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ false,
@@ -849,9 +849,9 @@ fn dec_lock_ref_replays_the_skip_set() {
     tc.arena
         .set_device_value(n1, FULL, Tensor::from_slice(&[0i64, 1]));
     tc.component_state_mut(FULL).evictable_size = 2;
-    let result = tc.inc_lock_ref(tc.arena.node(n3).id, true);
+    let result = tc.inc_lock_ref(tc.arena.node(n3).id, ComponentSet::EMPTY);
     let params = DecLockRefParams {
-        mamba_lock_acquired: result.mamba_lock_acquired,
+        skipped_lock_components: result.skipped_lock_components,
         ..Default::default()
     };
     // The still-evicted n2 and n3 are skipped instead of tripping the lock asserts.
@@ -902,7 +902,7 @@ fn temp_lock_counts_the_evicted_anchor_and_mirrors_on_release() {
         .set_device_value(y, FULL, Tensor::from_slice(&[0i64]));
     tc.component_state_mut(FULL).evictable_size = 3;
     // The temp lock counts the evicted anchor too (no ledger move).
-    let temp_lock = tc.inc_lock_ref(tc.arena.node(anchor).id, true);
+    let temp_lock = tc.inc_lock_ref(tc.arena.node(anchor).id, ComponentSet::EMPTY);
     assert_eq!(tc.arena.device_lock_ref(anchor, FULL), 1);
     assert_eq!(tc.arena.device_lock_ref(y, FULL), 1);
     assert_eq!(tc.arena.device_lock_ref(a, FULL), 1);
@@ -911,13 +911,13 @@ fn temp_lock_counts_the_evicted_anchor_and_mirrors_on_release() {
     tc.arena
         .set_device_value(anchor, FULL, Tensor::from_slice(&[0i64]));
     tc.inc_protected_size(FULL, 1);
-    let second_lock = tc.inc_lock_ref(tc.arena.node(anchor).id, true);
+    let second_lock = tc.inc_lock_ref(tc.arena.node(anchor).id, ComponentSet::EMPTY);
     assert_eq!(tc.arena.device_lock_ref(anchor, FULL), 2);
     assert_eq!(tc.arena.device_lock_ref(y, FULL), 2);
     assert_eq!(tc.arena.device_lock_ref(a, FULL), 2);
     // Each release takes back exactly its own refs.
     let temp_params = DecLockRefParams {
-        mamba_lock_acquired: temp_lock.mamba_lock_acquired,
+        skipped_lock_components: temp_lock.skipped_lock_components,
         ..Default::default()
     };
     tc.dec_lock_ref(
@@ -929,7 +929,7 @@ fn temp_lock_counts_the_evicted_anchor_and_mirrors_on_release() {
     assert_eq!(tc.arena.device_lock_ref(y, FULL), 1);
     assert_eq!(tc.arena.device_lock_ref(a, FULL), 1);
     let second_params = DecLockRefParams {
-        mamba_lock_acquired: second_lock.mamba_lock_acquired,
+        skipped_lock_components: second_lock.skipped_lock_components,
         ..Default::default()
     };
     tc.dec_lock_ref(
@@ -969,12 +969,12 @@ fn dec_lock_ref_panics_on_double_release() {
     tc.arena
         .set_device_value(n1, FULL, Tensor::from_slice(&[0i64, 1]));
     tc.component_state_mut(FULL).evictable_size = 2;
-    tc.inc_lock_ref(tc.arena.node(n2).id, true);
+    tc.inc_lock_ref(tc.arena.node(n2).id, ComponentSet::EMPTY);
     tc.dec_lock_ref(
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ false,
@@ -983,7 +983,7 @@ fn dec_lock_ref_panics_on_double_release() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ false,
@@ -994,12 +994,12 @@ fn dec_lock_ref_panics_on_double_release() {
 fn dec_lock_ref_with_skip_swa_still_releases_full() {
     let mut tc = core();
     let (_n1, n2) = lock_chain(&mut tc);
-    tc.inc_lock_ref(tc.arena.node(n2).id, true);
+    tc.inc_lock_ref(tc.arena.node(n2).id, ComponentSet::EMPTY);
     tc.dec_lock_ref(
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ true,
@@ -1012,13 +1012,13 @@ fn nested_locks_release_pairwise() {
     // Two acquires then two releases: sizes move only on the outermost pair.
     let mut tc = core();
     let (_n1, n2) = lock_chain(&mut tc);
-    tc.inc_lock_ref(tc.arena.node(n2).id, true);
-    tc.inc_lock_ref(tc.arena.node(n2).id, true);
+    tc.inc_lock_ref(tc.arena.node(n2).id, ComponentSet::EMPTY);
+    tc.inc_lock_ref(tc.arena.node(n2).id, ComponentSet::EMPTY);
     tc.dec_lock_ref(
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ false,
@@ -1031,7 +1031,7 @@ fn nested_locks_release_pairwise() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ false,
@@ -1051,7 +1051,7 @@ fn dec_lock_ref_panics_on_an_unlocked_node() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ false,
@@ -1085,7 +1085,7 @@ fn inc_lock_ref_panics_on_an_evicted_ancestor() {
     tc.arena
         .set_device_value(n2, FULL, Tensor::from_slice(&[0i64, 1, 2]));
     tc.component_state_mut(FULL).evictable_size = 3;
-    tc.inc_lock_ref(tc.arena.node(n2).id, true);
+    tc.inc_lock_ref(tc.arena.node(n2).id, ComponentSet::EMPTY);
 }
 
 #[test]
@@ -1104,7 +1104,7 @@ fn inc_lock_ref_panics_when_evictable_size_is_unaccounted() {
         .unwrap();
     tc.arena
         .set_device_value(n1, FULL, Tensor::from_slice(&[0i64]));
-    tc.inc_lock_ref(tc.arena.node(n1).id, true);
+    tc.inc_lock_ref(tc.arena.node(n1).id, ComponentSet::EMPTY);
 }
 
 #[test]
@@ -1120,7 +1120,7 @@ fn dec_lock_ref_panics_on_protected_underflow() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         /* skip_swa = */ false,
@@ -1228,7 +1228,7 @@ fn host_lock_round_trips_on_a_root_anchor_are_noops() {
     let result = tc.inc_host_lock_ref(tc.arena.node(root).id);
     assert_eq!(result.delta, None);
     assert_eq!(tc.arena.host_lock_ref(root, FULL), 0);
-    tc.dec_host_lock_ref(tc.arena.node(root).id, /* params = */ None);
+    tc.dec_host_lock_ref(tc.arena.node(root).id, &DecLockRefParams::default());
     assert_eq!(tc.arena.host_lock_ref(root, FULL), 0);
 }
 
@@ -1250,7 +1250,7 @@ fn dec_host_lock_ref_unpins_and_restores_the_h_leaf_set() {
     let node = host_lock_anchor(&mut tc);
     tc.component_state_mut(FULL).evictable_size = 7;
     tc.inc_host_lock_ref(tc.arena.node(node).id);
-    tc.dec_host_lock_ref(tc.arena.node(node).id, /* params = */ None);
+    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default());
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 0);
     assert!(tc.evictable_host_leaves.contains(node));
     let state = tc.component_state(FULL);
@@ -1262,7 +1262,7 @@ fn dec_host_lock_ref_unpins_and_restores_the_h_leaf_set() {
 fn dec_host_lock_ref_on_an_unlocked_anchor_is_a_noop() {
     let mut tc = core();
     let node = host_lock_anchor(&mut tc);
-    tc.dec_host_lock_ref(tc.arena.node(node).id, /* params = */ None);
+    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default());
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 0);
 }
 
@@ -1273,7 +1273,7 @@ fn dec_host_lock_ref_keeps_the_counter_when_the_host_value_is_gone() {
     let node = host_lock_anchor(&mut tc);
     tc.inc_host_lock_ref(tc.arena.node(node).id);
     let _ = tc.arena.take_host_value(node, FULL);
-    tc.dec_host_lock_ref(tc.arena.node(node).id, /* params = */ None);
+    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default());
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 1);
 }
 
@@ -1282,7 +1282,7 @@ fn host_lock_round_trip_under_write_back_is_a_pure_counter() {
     let mut tc = write_back_core();
     let (_n1, n2) = lock_chain(&mut tc);
     tc.inc_host_lock_ref(tc.arena.node(n2).id);
-    tc.dec_host_lock_ref(tc.arena.node(n2).id, /* params = */ None);
+    tc.dec_host_lock_ref(tc.arena.node(n2).id, &DecLockRefParams::default());
     assert_eq!(tc.arena.host_lock_ref(n2, FULL), 0);
     let state = tc.component_state(FULL);
     assert_eq!(state.evictable_size, 5);
@@ -1308,7 +1308,10 @@ fn release_host_arm_updates_the_h_leaf_set_without_the_dispatcher() {
     let node = host_lock_anchor(&mut tc);
     tc.inc_host_lock_ref(tc.arena.node(node).id);
     FullComponent.release_component_lock(
-        &mut tc, node, /* params = */ None, /* lock_host = */ true,
+        &mut tc,
+        node,
+        &DecLockRefParams::default(),
+        /* lock_host = */ true,
     );
     assert!(tc.evictable_host_leaves.contains(node));
 }
@@ -1319,10 +1322,10 @@ fn nested_host_locks_release_pairwise() {
     let node = host_lock_anchor(&mut tc);
     tc.inc_host_lock_ref(tc.arena.node(node).id);
     tc.inc_host_lock_ref(tc.arena.node(node).id);
-    tc.dec_host_lock_ref(tc.arena.node(node).id, /* params = */ None);
+    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default());
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 1);
     assert!(!tc.evictable_host_leaves.contains(node));
-    tc.dec_host_lock_ref(tc.arena.node(node).id, /* params = */ None);
+    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default());
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 0);
     assert!(tc.evictable_host_leaves.contains(node));
 }

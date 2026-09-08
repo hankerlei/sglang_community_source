@@ -335,7 +335,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
-        params: Option<&DecLockRefParams>,
+        _params: &DecLockRefParams,
         lock_host: bool,
     ) {
         if lock_host {

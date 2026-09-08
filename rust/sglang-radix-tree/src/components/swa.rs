@@ -34,10 +34,15 @@ impl SwaComponent {
 impl SwaComponent {
     /// Build the driver from the tree's init params.
     pub fn new(params: &CacheInitParams) -> Self {
+        let sliding_window_size = params
+            .swa_sliding_window_size
+            .expect("the SWA component requires swa_sliding_window_size");
+        assert!(
+            sliding_window_size > 0,
+            "swa_sliding_window_size must be positive"
+        );
         SwaComponent {
-            sliding_window_size: params
-                .swa_sliding_window_size
-                .expect("the SWA component requires swa_sliding_window_size"),
+            sliding_window_size,
         }
     }
 
@@ -1071,16 +1076,14 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
-        params: Option<&DecLockRefParams>,
+        params: &DecLockRefParams,
         lock_host: bool,
     ) {
-        let swa_uuid_for_lock = params.and_then(|p| {
-            if lock_host {
-                p.swa_uuid_for_host_lock
-            } else {
-                p.swa_uuid_for_lock
-            }
-        });
+        let swa_uuid_for_lock = if lock_host {
+            params.swa_uuid_for_host_lock
+        } else {
+            params.swa_uuid_for_lock
+        };
 
         let mut cur = node_id;
         loop {
@@ -1113,6 +1116,12 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 }
             }
             Self::dec_lock_ref(tree_core.arena.node_mut(cur), lock_host);
+            if lock_ref == 1 {
+                // This may have been the last lock holding the node out of
+                // the evictable-leaf sets; refresh it here rather than rely
+                // on the Full walk running after this one.
+                tree_core.update_evictable_leaf_sets_(cur);
+            }
             if swa_uuid_for_lock.is_some()
                 && Self::swa_uuid(tree_core.arena.node(cur), lock_host) == swa_uuid_for_lock
             {
@@ -1153,7 +1162,11 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             let has_value = node.has_device_value(SWA);
             let value_len = node.device_value_len(SWA);
             node.dec_device_lock_ref(SWA);
-            if node.device_lock_ref(SWA) == 0 && has_value {
+            let now_unlocked = node.device_lock_ref(SWA) == 0;
+            if now_unlocked {
+                tree_core.update_evictable_leaf_sets_(cur);
+            }
+            if now_unlocked && has_value {
                 tree_core.dec_protected_size(SWA, value_len);
                 tree_core.inc_evictable_size(SWA, value_len);
                 if tree_core.is_evictable_device_leaf_(tree_core.arena.node(cur)) {

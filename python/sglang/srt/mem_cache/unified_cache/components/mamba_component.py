@@ -455,7 +455,7 @@ class MambaComponent(TreeComponent):
     def release_component_lock(
         self,
         node: UnifiedTreeNode,
-        params: Optional[DecLockRefParams],
+        params: DecLockRefParams,
         lock_host: bool = False,
     ) -> None:
         ct = self.component_type
@@ -469,10 +469,12 @@ class MambaComponent(TreeComponent):
                 f"Mamba release hit host_lock_ref=0 on node {node.id}"
             )
             cd.host_lock_ref -= 1
-            if cd.host_lock_ref == 0 and cd.value is None and cd.host_value is not None:
-                host_lru = self.tree_core.host_lru_lists[ct]
-                if not host_lru.in_list(node):
-                    host_lru.insert_mru(node)
+            if cd.host_lock_ref == 0:
+                if cd.value is None and cd.host_value is not None:
+                    host_lru = self.tree_core.host_lru_lists[ct]
+                    if not host_lru.in_list(node):
+                        host_lru.insert_mru(node)
+                self.tree_core._update_evictable_leaf_sets(node)
             return
 
         assert cd.lock_ref > 0, f"Mamba release hit lock_ref=0 on node {node.id}"
@@ -481,6 +483,8 @@ class MambaComponent(TreeComponent):
             self.tree_core.component_evictable_size_[ct] += vlen
             self.tree_core.component_protected_size_[ct] -= vlen
         cd.lock_ref -= 1
+        if cd.lock_ref == 0:
+            self.tree_core._update_evictable_leaf_sets(node)
 
     def _alloc_mamba_slot(self) -> torch.Tensor:
         """Allocate one mamba pool slot, evicting if necessary."""

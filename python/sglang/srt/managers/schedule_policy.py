@@ -959,10 +959,8 @@ class PrefillAdder:
         self._account_prefill_cache_admission(req, prefix_len)
 
     def _req_inc_lock_ref(self, req: Req):
-        result = self.tree_cache.inc_lock_ref(req.last_node)
         # Persist the release receipt.
-        req.swa_uuid_for_lock = result.swa_uuid_for_lock
-        req.mamba_lock_acquired = result.mamba_lock_acquired
+        req.lock_receipt = self.tree_cache.inc_lock_ref(req.last_node).to_dec_params()
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None

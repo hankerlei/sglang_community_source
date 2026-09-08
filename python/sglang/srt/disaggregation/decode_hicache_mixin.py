@@ -12,7 +12,6 @@ import torch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
     InitLoadBackParams,
 )
 
@@ -189,10 +188,10 @@ class DecodeHiCacheTransferMixin:
         if decode_req.hicache_restored_node is not None:
             self.tree_cache.dec_lock_ref(
                 decode_req.hicache_restored_node,
-                decode_req.hicache_restored_lock_params,
+                decode_req.hicache_restore_lock_receipt,
             )
             decode_req.hicache_restored_node = None
-            decode_req.hicache_restored_lock_params = None
+            decode_req.hicache_restore_lock_receipt = None
 
     def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
         """Queue one L2->L1 load_back op for ``dr``; True iff a DMA was queued.
@@ -228,7 +227,8 @@ class DecodeHiCacheTransferMixin:
         # The rematch repointed req.last_node to feed init_load_back's device
         # boundary, but the prealloc lock and the receipt on the req still
         # belong to pm.last_device_node; restore the pairing so any release
-        # before the commit hands over the restored lock hits the right node.
+        # before the commit hands over the restored lock hits the right node
+        # (the receipt's anchor makes a mispaired release assert).
         dr.req.last_node = pm.last_device_node
         # Failback: total coverage < required prefix means device alloc likely failed.
         if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
@@ -250,7 +250,7 @@ class DecodeHiCacheTransferMixin:
             [rematch.device_indices[pm.l1_prefix_len :], new_indices]
         )
         dr.hicache_restored_node = restored_node
-        dr.hicache_restored_lock_params = self.tree_cache.inc_lock_ref(
+        dr.hicache_restore_lock_receipt = self.tree_cache.inc_lock_ref(
             restored_node
         ).to_dec_params()
 
@@ -319,16 +319,13 @@ class DecodeHiCacheTransferMixin:
 
         req = decode_req.req
         restored_node = decode_req.hicache_restored_node
-        restored_params = decode_req.hicache_restored_lock_params
+        restored_lock_receipt = decode_req.hicache_restore_lock_receipt
         assert restored_node is not None
-        assert restored_params is not None
+        assert restored_lock_receipt is not None
         # Release preallocation before installing the restored lock receipt.
         self.tree_cache.dec_lock_ref(
             prefix_match.last_device_node,
-            DecLockRefParams(
-                swa_uuid_for_lock=req.swa_uuid_for_lock,
-                mamba_lock_acquired=req.mamba_lock_acquired,
-            ),
+            req.lock_receipt,
             skip_swa=req.swa_prefix_lock_released,
         )
 
@@ -343,9 +340,8 @@ class DecodeHiCacheTransferMixin:
             [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
         )
         req.last_node = restored_node
-        req.swa_uuid_for_lock = restored_params.swa_uuid_for_lock
-        req.mamba_lock_acquired = restored_params.mamba_lock_acquired
+        req.lock_receipt = restored_lock_receipt
         req.swa_prefix_lock_released = False
         # Prevent abort cleanup from releasing the transferred lock.
         decode_req.hicache_restored_node = None
-        decode_req.hicache_restored_lock_params = None
+        decode_req.hicache_restore_lock_receipt = None

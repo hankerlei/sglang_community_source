@@ -4,7 +4,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams, MatchResult
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -99,9 +99,8 @@ class _FakeReq:
         self.extra_key = None
         self.cache_salt = None
         self.last_node = None
-        self.swa_uuid_for_lock = None
         self.swa_branching_seqlen = None
-        self.mamba_lock_acquired = False
+        self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
         self.to_finish = None
         self.finished_reason = None
@@ -256,7 +255,6 @@ def test_release_session_threads_mamba_lock_receipt():
             cache_protected_len=0,
         ),
         last_node=lock_node,
-        mamba_lock_acquired=False,
     )
 
     tree_cache.release_session("session-a")
@@ -264,7 +262,7 @@ def test_release_session_threads_mamba_lock_receipt():
     assert inner.dec_lock_ref_calls == [lock_node]
     params = inner.dec_lock_ref_params[0]
     assert params is not None
-    assert params.mamba_lock_acquired is False
+    assert params.skipped_lock_components == ()
     assert inner.dec_lock_ref_skip_swa == [False]
 
 
@@ -288,13 +286,14 @@ def test_release_session_skips_swa_after_early_release():
             cache_protected_len=0,
         ),
         last_node=lock_node,
-        swa_uuid_for_lock=7,
+        lock_receipt=DecLockRefParams(node_id=42, swa_uuid_for_lock=7),
         swa_prefix_lock_released=True,
     )
 
     tree_cache.release_session("session-a")
 
     assert inner.dec_lock_ref_calls == [lock_node]
+    assert inner.dec_lock_ref_params[0].swa_uuid_for_lock == 7
     assert inner.dec_lock_ref_skip_swa == [True]
 
 

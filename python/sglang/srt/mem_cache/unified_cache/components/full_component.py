@@ -309,7 +309,7 @@ class FullComponent(TreeComponent):
     def release_component_lock(
         self,
         node: UnifiedTreeNode,
-        params: Optional[DecLockRefParams],
+        params: DecLockRefParams,
         lock_host: bool = False,
     ) -> None:
         ct = self.component_type

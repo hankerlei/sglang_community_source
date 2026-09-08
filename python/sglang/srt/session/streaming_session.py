@@ -48,9 +48,8 @@ class SessionSlot:
 
     # First req's radix tree node (for dec_lock_ref on session close)
     last_node: Any = None
-    swa_uuid_for_lock: Optional[int] = None
-    # Receipt bit for the first request's Mamba lock.
-    mamba_lock_acquired: bool = False
+    # Receipt of the first request's tree lock on last_node.
+    lock_receipt: DecLockRefParams = field(default_factory=DecLockRefParams)
     # Whether the first request already released its SWA lock.
     swa_prefix_lock_released: bool = False
 
@@ -59,8 +58,7 @@ class SessionSlot:
         kv = req.detach_kv()
         if is_first:
             self.last_node = req.last_node
-            self.swa_uuid_for_lock = req.swa_uuid_for_lock
-            self.mamba_lock_acquired = req.mamba_lock_acquired
+            self.lock_receipt = req.lock_receipt
             self.swa_prefix_lock_released = req.swa_prefix_lock_released
             # The slot takes over the request's KV record.
             self.kv = kv
@@ -73,8 +71,7 @@ class SessionSlot:
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
         req.kv = self.kv
-        req.swa_uuid_for_lock = self.swa_uuid_for_lock
-        req.mamba_lock_acquired = self.mamba_lock_acquired
+        req.lock_receipt = self.lock_receipt
         req.swa_prefix_lock_released = self.swa_prefix_lock_released
 
         # NOTE: the slot keeps sharing the record it just handed out. During
@@ -293,8 +290,7 @@ class StreamingSession(BasePrefixCache):
                 slot = SessionSlot(
                     kv=kv,
                     last_node=req.last_node,
-                    swa_uuid_for_lock=req.swa_uuid_for_lock,
-                    mamba_lock_acquired=req.mamba_lock_acquired,
+                    lock_receipt=req.lock_receipt,
                     swa_prefix_lock_released=req.swa_prefix_lock_released,
                 )
                 self.slots[session_id] = slot
@@ -403,14 +399,7 @@ class StreamingSession(BasePrefixCache):
             # skip_swa is an SWA-cache extension kwarg; a slot can only have
             # early-released when the inner cache supports SWA locks.
             skip = {"skip_swa": True} if slot.swa_prefix_lock_released else {}
-            self.inner.dec_lock_ref(
-                lock_node,
-                DecLockRefParams(
-                    swa_uuid_for_lock=slot.swa_uuid_for_lock,
-                    mamba_lock_acquired=slot.mamba_lock_acquired,
-                ),
-                **skip,
-            )
+            self.inner.dec_lock_ref(lock_node, slot.lock_receipt, **skip)
 
         if slot.kv.holds_kv:
             self.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])

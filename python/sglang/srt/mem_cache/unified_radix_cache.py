@@ -790,14 +790,14 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def inc_lock_ref(
-        self, node_id: NodeId, lock_mamba: bool = True
+        self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
     ) -> IncLockRefResult:
         result = self.session.try_inc_lock_ref(node_id)
         if result is not None:
             return result
         if self.disable:
             return IncLockRefResult()
-        return self.tree_core.inc_lock_ref(node_id, lock_mamba)
+        return self.tree_core.inc_lock_ref(node_id, skip_lock_components)
 
     def dec_lock_ref(
         self,
@@ -815,14 +815,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _dec_req_lock(self, req: Req, *, skip_swa: bool = False) -> None:
         """Release the tree lock a request holds on its last_node with the
         receipt its acquire returned, so it never drops a lock it never took."""
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(
-                swa_uuid_for_lock=req.swa_uuid_for_lock,
-                mamba_lock_acquired=req.mamba_lock_acquired,
-            ),
-            skip_swa=skip_swa,
-        )
+        self.dec_lock_ref(req.last_node, req.lock_receipt, skip_swa=skip_swa)
 
     def dec_swa_lock_only(
         self,
@@ -1029,7 +1022,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # whole batch before locking would break that. Off = original full lock.
         lock_result = self.inc_lock_ref(
             new_last_node,
-            lock_mamba=not envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get(),
+            skip_lock_components=(
+                (ComponentType.MAMBA,)
+                if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+                else ()
+            ),
         )
 
         # Update req fields
@@ -1041,9 +1038,8 @@ class UnifiedRadixCache(BasePrefixCache):
             req.prefix_indices = new_indices
         req.kv.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
-        req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
-        # carry the receipt so this node's dec releases only what we locked
-        req.mamba_lock_acquired = lock_result.mamba_lock_acquired
+        # Carry the receipt so this node's dec releases only what we locked.
+        req.lock_receipt = lock_result.to_dec_params()
         # The rematch acquired a new SWA prefix lock.
         req.swa_prefix_lock_released = False
 

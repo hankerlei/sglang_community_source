@@ -649,9 +649,8 @@ def bench_cache_finished(
         req.last_node = node
         req.kv.cache_protected_len = matched_len
         req.kv.kv_committed_len = len(seq)
-        if hasattr(lr, "swa_uuid_for_lock"):
-            req.swa_uuid_for_lock = lr.swa_uuid_for_lock
-        req.mamba_lock_acquired = lr.mamba_lock_acquired
+        if hasattr(lr, "to_dec_params"):
+            req.lock_receipt = lr.to_dec_params()
         env.rtp.req_to_token[req.kv.req_pool_idx, : len(kv_indices)] = kv_indices
         req_items.append(req)
 

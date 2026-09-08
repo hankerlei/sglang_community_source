@@ -8,7 +8,9 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use tch::{Device, Kind, Tensor};
 
-use crate::components::{self, FullComponent, MambaComponent, SwaComponent, TreeComponent};
+use crate::components::{
+    self, ComponentSet, FullComponent, MambaComponent, SwaComponent, TreeComponent,
+};
 use crate::components::{
     BASE_COMPONENT_TYPE, ComponentType, FULL, MAMBA, NUM_COMPONENT_TYPES, SWA,
 };
@@ -43,12 +45,14 @@ fn next_coexist_reclaim_digest(current: i64, node_id: NodeId, component_idx: usi
 pub struct IncLockRefResult {
     /// Tokens newly protected (moved out of evictable) by this lock.
     pub delta: Option<usize>,
+    /// The node the lock was taken on; a release replays the receipt there only.
+    pub node_id: Option<NodeId>,
     /// SWA lock-window uuid minted/reused by the device lock walk.
     pub swa_uuid_for_lock: Option<i64>,
     /// SWA lock-window uuid minted/reused by the host lock walk.
     pub swa_uuid_for_host_lock: Option<i64>,
-    /// Whether the acquire took the single-node Mamba lock.
-    pub mamba_lock_acquired: bool,
+    /// Components the acquire left untaken; the release skips them too.
+    pub skipped_lock_components: ComponentSet,
 }
 
 /// Params for `dec_lock_ref`. Receipt fields default to nothing-acquired so
@@ -56,12 +60,15 @@ pub struct IncLockRefResult {
 /// releasing a lock another holder owns.
 #[derive(Default)]
 pub struct DecLockRefParams {
+    /// The node the matching acquire locked; None only for receipts that did
+    /// not come from this core (a mispaired anchor is a protocol violation).
+    pub node_id: Option<NodeId>,
     /// SWA lock-window uuid the device unlock stops at, from the matching acquire.
     pub swa_uuid_for_lock: Option<i64>,
     /// SWA lock-window uuid the host unlock stops at, from the matching acquire.
     pub swa_uuid_for_host_lock: Option<i64>,
-    /// Whether the matching acquire took the single-node Mamba lock.
-    pub mamba_lock_acquired: bool,
+    /// Components the matching acquire left untaken.
+    pub skipped_lock_components: ComponentSet,
 }
 
 /// Result of `dec_lock_ref`.
@@ -798,65 +805,90 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.swa_uuid_counter
     }
 
-    /// Bump the reference count on a node's component locks; lock_mamba=false
-    /// leaves the single-node mamba lock untaken (recorded in the result).
-    pub fn inc_lock_ref(&mut self, node_id: NodeId, lock_mamba: bool) -> IncLockRefResult {
-        let node_id = self.arena.resolve(node_id);
-        // The result records what was locked; the paired dec mirrors it.
+    /// Bump the reference count on a node's component locks. Components in
+    /// `skip_lock_components` are left untaken; the receipt records the anchor
+    /// node and the skipped set so the paired release mirrors them.
+    pub fn inc_lock_ref(
+        &mut self,
+        node_id: NodeId,
+        skip_lock_components: ComponentSet,
+    ) -> IncLockRefResult {
+        let node_idx = self.arena.resolve(node_id);
         let mut result = IncLockRefResult {
-            mamba_lock_acquired: lock_mamba,
+            node_id: Some(self.arena.node(node_idx).id),
+            skipped_lock_components: skip_lock_components,
             ..Default::default()
         };
         for i in 0..self.components.len() {
             let component = Arc::clone(&self.components[i]);
-            if !lock_mamba && component.component_type() == MAMBA {
+            if skip_lock_components.contains(component.component_type()) {
                 continue;
             }
             result = component
-                .acquire_component_lock(self, node_id, result, /* lock_host = */ false);
+                .acquire_component_lock(self, node_idx, result, /* lock_host = */ false);
         }
-        self.update_evictable_leaf_sets_(node_id);
+        self.update_evictable_leaf_sets_(node_idx);
         result
     }
 
+    /// A receipt releases only the node its acquire returned; a mispaired
+    /// node would silently release (or steal) another holder's segment.
+    fn assert_receipt_anchor_(&self, node_idx: NodeIdx_, params: &DecLockRefParams) {
+        if let Some(anchor) = params.node_id {
+            assert!(
+                self.arena.try_resolve(anchor) == Some(node_idx),
+                "lock receipt anchored on node {anchor} released on node {}",
+                self.arena.node(node_idx).id
+            );
+        }
+    }
+
+    /// Release each component this receipt acquired. Auxiliaries go first so
+    /// Full, whose walk refreshes leaf membership on every node it unlocks,
+    /// sees their final refs; the auxiliary walks also refresh the nodes they
+    /// unlock, so the order is not load-bearing for the sets.
+    fn release_components_(
+        &mut self,
+        node_idx: NodeIdx_,
+        params: &DecLockRefParams,
+        lock_host: bool,
+        skip_swa_and_below: bool,
+    ) {
+        let swa_priority = if skip_swa_and_below {
+            self.try_component_by_type_(SWA)
+                .map(|swa| swa.eviction_priority(/* is_leaf = */ false))
+        } else {
+            None
+        };
+        for i in (0..self.components.len()).rev() {
+            let component = Arc::clone(&self.components[i]);
+            let ct = component.component_type();
+            if params.skipped_lock_components.contains(ct) {
+                continue;
+            }
+            if let Some(swa_priority) = swa_priority
+                && (ct == SWA || component.eviction_priority(/* is_leaf = */ false) < swa_priority)
+            {
+                continue;
+            }
+            component.release_component_lock(self, node_idx, params, lock_host);
+        }
+    }
+
     /// Decrease the reference count on a node's component locks. The receipt
-    /// is required: a release must replay its acquire's evidence.
+    /// is required: a release must replay its acquire's evidence. After an SWA
+    /// early release (`dec_swa_lock_only`), `skip_swa` leaves SWA and the
+    /// lower-priority components it already dropped alone.
     pub fn dec_lock_ref(
         &mut self,
         node_id: NodeId,
         params: &DecLockRefParams,
         skip_swa: bool,
     ) -> DecLockRefResult {
-        let node_id = self.arena.resolve(node_id);
-        let mamba_lock_acquired = params.mamba_lock_acquired;
-        // skip_swa mirrors dec_swa_lock_only, which also dropped every
-        // strictly-lower-priority component's lock (e.g. Mamba) — skipping
-        // only SWA here would double-release those.
-        let swa_priority = if skip_swa {
-            self.try_component_by_type_(SWA)
-                .map(|swa| swa.eviction_priority(/* is_leaf = */ false))
-        } else {
-            None
-        };
-        for i in 0..self.components.len() {
-            let component = Arc::clone(&self.components[i]);
-            let ct = component.component_type();
-            if let Some(swa_priority) = swa_priority
-                && (ct == SWA || component.eviction_priority(/* is_leaf = */ false) < swa_priority)
-            {
-                continue;
-            }
-            if !mamba_lock_acquired && ct == MAMBA {
-                continue;
-            }
-            component.release_component_lock(
-                self,
-                node_id,
-                Some(params),
-                /* lock_host = */ false,
-            );
-        }
-        self.update_evictable_leaf_sets_(node_id);
+        let node_idx = self.arena.resolve(node_id);
+        self.assert_receipt_anchor_(node_idx, params);
+        self.release_components_(node_idx, params, /* lock_host = */ false, skip_swa);
+        self.update_evictable_leaf_sets_(node_idx);
         // TODO: delta is not aggregated from components; no caller uses it yet.
         DecLockRefResult::default()
     }
@@ -870,33 +902,33 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
     ) {
-        let node_id = self.arena.resolve(node_id);
+        let node_idx = self.arena.resolve(node_id);
+        self.assert_receipt_anchor_(node_idx, params);
         let Some(swa) = self.try_component_by_type_(SWA) else {
             return;
         };
         swa.release_window_lock(
             self,
-            node_id,
+            node_idx,
             params.swa_uuid_for_lock,
             device_frees,
             host_frees,
         );
 
-        // Drop strictly-lower-priority locks (e.g. Mamba) co-located on the
-        // node, skipping any the paired inc never took.
+        // Drop strictly-lower-priority locks co-located on the node, skipping
+        // any the paired inc never took.
         let swa_priority = swa.eviction_priority(/* is_leaf = */ false);
-        for i in 0..self.components.len() {
+        for i in (0..self.components.len()).rev() {
             let component = Arc::clone(&self.components[i]);
-            if !params.mamba_lock_acquired && component.component_type() == MAMBA {
+            if params
+                .skipped_lock_components
+                .contains(component.component_type())
+            {
                 continue;
             }
             if component.eviction_priority(/* is_leaf = */ false) < swa_priority {
-                component.release_component_lock(
-                    self,
-                    node_id,
-                    Some(params),
-                    /* lock_host = */ false,
-                );
+                component
+                    .release_component_lock(self, node_idx, params, /* lock_host = */ false);
             }
         }
     }
@@ -918,29 +950,31 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Bump the reference count on a node's host-side component locks.
     pub fn inc_host_lock_ref(&mut self, node_id: NodeId) -> IncLockRefResult {
-        let node_id = self.arena.resolve(node_id);
-        let mut result = IncLockRefResult::default();
+        let node_idx = self.arena.resolve(node_id);
+        let mut result = IncLockRefResult {
+            node_id: Some(self.arena.node(node_idx).id),
+            ..Default::default()
+        };
         for i in 0..self.components.len() {
             let component = Arc::clone(&self.components[i]);
             result = component
-                .acquire_component_lock(self, node_id, result, /* lock_host = */ true);
+                .acquire_component_lock(self, node_idx, result, /* lock_host = */ true);
         }
-        self.update_evictable_leaf_sets_(node_id);
+        self.update_evictable_leaf_sets_(node_idx);
         result
     }
 
     /// Decrease the reference count on a node's host-side component locks.
+    /// The receipt is required, as for `dec_lock_ref`.
     pub fn dec_host_lock_ref(
         &mut self,
         node_id: NodeId,
-        params: Option<&DecLockRefParams>,
+        params: &DecLockRefParams,
     ) -> DecLockRefResult {
-        let node_id = self.arena.resolve(node_id);
-        for i in 0..self.components.len() {
-            let component = Arc::clone(&self.components[i]);
-            component.release_component_lock(self, node_id, params, /* lock_host = */ true);
-        }
-        self.update_evictable_leaf_sets_(node_id);
+        let node_idx = self.arena.resolve(node_id);
+        self.assert_receipt_anchor_(node_idx, params);
+        self.release_components_(node_idx, params, /* lock_host = */ true, false);
+        self.update_evictable_leaf_sets_(node_idx);
         DecLockRefResult::default()
     }
 

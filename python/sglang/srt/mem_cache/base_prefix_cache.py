@@ -133,31 +133,42 @@ class EvictResult:
 class IncLockRefResult:
     """Receipt returned by ``inc_lock_ref``.
 
-    The SWA UUID marks the segment boundary; ``None`` means root.
-    ``mamba_lock_acquired`` records whether Mamba was included.
+    ``node_id`` is the anchor the lock was taken on; a release replays the
+    receipt on that node only. The SWA UUID marks the segment boundary;
+    ``None`` means root. ``skipped_lock_components`` records the components
+    the acquire left untaken, so the release leaves them untouched.
     """
 
     delta: Optional[int] = None
+    node_id: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
-    mamba_lock_acquired: bool = False
+    skipped_lock_components: tuple[ComponentType, ...] = ()
 
     def to_dec_params(self) -> DecLockRefParams:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
         return DecLockRefParams(
+            node_id=self.node_id,
             swa_uuid_for_lock=self.swa_uuid_for_lock,
             swa_uuid_for_host_lock=self.swa_uuid_for_host_lock,
-            mamba_lock_acquired=self.mamba_lock_acquired,
+            skipped_lock_components=tuple(self.skipped_lock_components),
         )
 
 
 @dataclasses.dataclass
 class DecLockRefParams:
-    """Receipt required by unified-tree ``dec_lock_ref``."""
+    """Receipt required by unified-tree ``dec_lock_ref``.
 
+    Fields default to nothing-acquired, so a lost receipt under-releases (a
+    leak the sanity checks report) instead of releasing another holder's
+    lock. ``node_id`` is ``None`` only for receipts that never came from a
+    unified-tree acquire (legacy caches, session sentinels).
+    """
+
+    node_id: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
-    mamba_lock_acquired: bool = False
+    skipped_lock_components: tuple[ComponentType, ...] = ()
 
 
 @dataclasses.dataclass

@@ -1,5 +1,5 @@
 use super::*;
-use crate::components::{FULL, MAMBA, SWA};
+use crate::components::{ComponentSet, FULL, MAMBA, SWA};
 use crate::test_utils::{accumulate_step, action_kinds};
 use crate::unified_tree_core::CacheInitParams;
 
@@ -1627,7 +1627,7 @@ fn inc_lock_ref_runs_full_and_swa_walks_together() {
     store_swa_device(&mut tc, a);
     store_swa_device(&mut tc, b);
     store_swa_device(&mut tc, c);
-    let result = tc.inc_lock_ref(tc.arena.node(c).id, true);
+    let result = tc.inc_lock_ref(tc.arena.node(c).id, ComponentSet::EMPTY);
     // FULL counts its valueless bottom segment (no ledger move); SWA locks
     // its window.
     assert_eq!(result.delta, Some(0));
@@ -1660,10 +1660,10 @@ fn inc_host_lock_ref_runs_full_and_swa_host_arms_together() {
     // The release replays the acquire's uuid and unwinds both arms.
     let params = DecLockRefParams {
         swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        mamba_lock_acquired: result.mamba_lock_acquired,
+        skipped_lock_components: result.skipped_lock_components,
         ..Default::default()
     };
-    tc.dec_host_lock_ref(tc.arena.node(c).id, Some(&params));
+    tc.dec_host_lock_ref(tc.arena.node(c).id, &params);
     assert_eq!(tc.arena.host_lock_ref(c, FULL), 0);
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 0);
@@ -1689,10 +1689,10 @@ fn dec_host_lock_ref_with_the_inner_uuid_leaves_an_outer_window_pinned() {
     // window's lock above the boundary survives.
     let params = DecLockRefParams {
         swa_uuid_for_host_lock: inner.swa_uuid_for_host_lock,
-        mamba_lock_acquired: inner.mamba_lock_acquired,
+        skipped_lock_components: inner.skipped_lock_components,
         ..Default::default()
     };
-    tc.dec_host_lock_ref(tc.arena.node(c).id, Some(&params));
+    tc.dec_host_lock_ref(tc.arena.node(c).id, &params);
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.host_lock_ref(a, SWA), 1);
@@ -1992,11 +1992,12 @@ fn release_lock_returns_the_window_to_evictable() {
         /* lock_host = */ false,
     );
     let params = DecLockRefParams {
+        node_id: None,
         swa_uuid_for_lock: result.swa_uuid_for_lock,
         swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        mamba_lock_acquired: result.mamba_lock_acquired,
+        skipped_lock_components: result.skipped_lock_components,
     };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ false);
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
@@ -2025,11 +2026,12 @@ fn release_lock_keeps_sizes_while_other_locks_remain() {
         /* lock_host = */ false,
     );
     let params = DecLockRefParams {
+        node_id: None,
         swa_uuid_for_lock: first.swa_uuid_for_lock,
         swa_uuid_for_host_lock: first.swa_uuid_for_host_lock,
-        mamba_lock_acquired: first.mamba_lock_acquired,
+        skipped_lock_components: first.skipped_lock_components,
     };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ false);
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.swa_evictable_size(), 1);
@@ -2052,11 +2054,12 @@ fn release_lock_replays_the_tombstone_skips() {
     // b gained a device value AFTER the acquire recorded it as a tombstone.
     store_swa_device(&mut tc, b);
     let params = DecLockRefParams {
+        node_id: None,
         swa_uuid_for_lock: result.swa_uuid_for_lock,
         swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        mamba_lock_acquired: result.mamba_lock_acquired,
+        skipped_lock_components: result.skipped_lock_components,
     };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ false);
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
@@ -2083,11 +2086,12 @@ fn release_lock_stops_at_the_window_uuid() {
         .node_mut(a)
         .set_lock_ref_(ValueSlotIdx::device(SWA), 1);
     let params = DecLockRefParams {
+        node_id: None,
         swa_uuid_for_lock: result.swa_uuid_for_lock,
         swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        mamba_lock_acquired: result.mamba_lock_acquired,
+        skipped_lock_components: result.skipped_lock_components,
     };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ false);
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 1);
@@ -2116,11 +2120,12 @@ fn release_host_lock_stops_at_the_host_uuid_boundary() {
         /* lock_host = */ true,
     );
     let params = DecLockRefParams {
+        node_id: None,
         swa_uuid_for_lock: result.swa_uuid_for_lock,
         swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        mamba_lock_acquired: result.mamba_lock_acquired,
+        skipped_lock_components: result.skipped_lock_components,
     };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ true);
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ true);
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 0);
     assert_eq!(tc.arena.host_lock_ref(a, SWA), 1);
@@ -2144,7 +2149,10 @@ fn release_lock_without_the_boundary_uuid_dies_at_the_segment_edge() {
     // A receipt-less release overshoots the boundary into unlocked territory
     // and dies there instead of silently stealing whatever it crosses.
     swa.release_component_lock(
-        &mut tc, c, /* params = */ None, /* lock_host = */ false,
+        &mut tc,
+        c,
+        &DecLockRefParams::default(),
+        /* lock_host = */ false,
     );
 }
 
@@ -2164,11 +2172,12 @@ fn release_host_lock_reparks_tombstoned_host_nodes() {
         /* lock_host = */ true,
     );
     let params = DecLockRefParams {
+        node_id: None,
         swa_uuid_for_lock: result.swa_uuid_for_lock,
         swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        mamba_lock_acquired: result.mamba_lock_acquired,
+        skipped_lock_components: result.skipped_lock_components,
     };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ true);
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ true);
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 0);
     assert!(tc.host_lru_list(SWA).in_list(Some(c)));
@@ -2183,11 +2192,12 @@ fn inc_then_dec_lock_ref_roundtrips_with_dec_params() {
     store_swa_device(&mut tc, a);
     store_swa_device(&mut tc, b);
     store_swa_device(&mut tc, c);
-    let result = tc.inc_lock_ref(tc.arena.node(c).id, true);
+    let result = tc.inc_lock_ref(tc.arena.node(c).id, ComponentSet::EMPTY);
     let params = DecLockRefParams {
+        node_id: None,
         swa_uuid_for_lock: result.swa_uuid_for_lock,
         swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        mamba_lock_acquired: result.mamba_lock_acquired,
+        skipped_lock_components: result.skipped_lock_components,
     };
     tc.dec_lock_ref(tc.arena.node(c).id, &params, /* skip_swa = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
@@ -2208,14 +2218,14 @@ fn dec_swa_lock_only_releases_swa_while_full_stays_locked() {
     }
     // Fund FULL's evictable counter for its lock walk (raw slot sets skip it).
     tc.component_state_mut(FULL).evictable_size = 3;
-    let result = tc.inc_lock_ref(tc.arena.node(c).id, true);
+    let result = tc.inc_lock_ref(tc.arena.node(c).id, ComponentSet::EMPTY);
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
     tc.dec_swa_lock_only(
         tc.arena.node(c).id,
         &DecLockRefParams {
             swa_uuid_for_lock: result.swa_uuid_for_lock,
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         &mut device_frees,
@@ -2255,7 +2265,7 @@ fn dec_swa_lock_only_evicts_a_fully_unlocked_device_leaf() {
         tc.arena.node(c).id,
         &DecLockRefParams {
             swa_uuid_for_lock: result.swa_uuid_for_lock,
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         &mut device_frees,
@@ -2281,7 +2291,7 @@ fn dec_swa_lock_only_is_a_noop_without_the_swa_component() {
         tc.arena.node(root).id,
         &DecLockRefParams {
             swa_uuid_for_lock: None,
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         &mut device_frees,
@@ -2360,11 +2370,12 @@ fn release_lock_skip_set_leaves_a_relocked_tombstone_credited() {
         /* lock_host = */ false,
     );
     let params = DecLockRefParams {
+        node_id: None,
         swa_uuid_for_lock: first.swa_uuid_for_lock,
         swa_uuid_for_host_lock: first.swa_uuid_for_host_lock,
-        mamba_lock_acquired: first.mamba_lock_acquired,
+        skipped_lock_components: first.skipped_lock_components,
     };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ false);
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
@@ -2391,9 +2402,9 @@ fn double_release_with_one_receipt_dies_loud() {
         swa_uuid_for_lock: result.swa_uuid_for_lock,
         ..Default::default()
     };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ false);
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     // Consuming the same receipt twice dies at the first unlocked node.
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ false);
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
 }
 
 #[test]
@@ -2422,7 +2433,7 @@ fn dec_swa_lock_only_releases_the_window_exactly_once() {
         tc.arena.node(c).id,
         &DecLockRefParams {
             swa_uuid_for_lock: first.swa_uuid_for_lock,
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         &mut device_frees,
@@ -2437,7 +2448,7 @@ fn dec_swa_lock_only_releases_the_window_exactly_once() {
         tc.arena.node(c).id,
         &DecLockRefParams {
             swa_uuid_for_lock: first.swa_uuid_for_lock,
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         &mut device_frees,
@@ -2476,7 +2487,7 @@ fn dec_swa_lock_only_leaves_out_of_window_swa_locks_alone() {
         tc.arena.node(c).id,
         &DecLockRefParams {
             swa_uuid_for_lock: result.swa_uuid_for_lock,
-            mamba_lock_acquired: true,
+            skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         &mut device_frees,
@@ -2552,11 +2563,12 @@ fn release_host_lock_does_not_repark_a_node_whose_host_value_was_taken() {
     // device value either, so the release has nothing to park.
     let _ = tc.arena.take_host_value(a, SWA);
     let params = DecLockRefParams {
+        node_id: None,
         swa_uuid_for_lock: result.swa_uuid_for_lock,
         swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        mamba_lock_acquired: result.mamba_lock_acquired,
+        skipped_lock_components: result.skipped_lock_components,
     };
-    swa.release_component_lock(&mut tc, a, Some(&params), /* lock_host = */ true);
+    swa.release_component_lock(&mut tc, a, &params, /* lock_host = */ true);
     assert_eq!(tc.arena.host_lock_ref(a, SWA), 0);
     assert!(!tc.host_lru_list(SWA).in_list(Some(a)));
 }
@@ -2578,11 +2590,12 @@ fn release_host_lock_skips_reparking_device_valued_nodes() {
         /* lock_host = */ true,
     );
     let params = DecLockRefParams {
+        node_id: None,
         swa_uuid_for_lock: result.swa_uuid_for_lock,
         swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        mamba_lock_acquired: result.mamba_lock_acquired,
+        skipped_lock_components: result.skipped_lock_components,
     };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ true);
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ true);
     // Device-valued nodes never re-park in the host LRU on host release.
     assert!(!tc.host_lru_list(SWA).in_list(Some(c)));
     assert!(!tc.host_lru_list(SWA).in_list(Some(b)));
@@ -2606,11 +2619,12 @@ fn release_host_lock_leaves_an_already_listed_node_listed() {
     // Something re-listed b while the lock was held (e.g. a split re-park).
     tc.host_lru_list_mut(SWA).insert_mru(b);
     let params = DecLockRefParams {
+        node_id: None,
         swa_uuid_for_lock: result.swa_uuid_for_lock,
         swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        mamba_lock_acquired: result.mamba_lock_acquired,
+        skipped_lock_components: result.skipped_lock_components,
     };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ true);
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ true);
     assert!(tc.host_lru_list(SWA).in_list(Some(b)));
     assert!(tc.host_lru_list(SWA).in_list(Some(c)));
     let _ = a;
@@ -4846,11 +4860,12 @@ fn deep_swa_tree_survives_backup_evict_and_load_back_rounds() {
                 comp_xfers,
             );
             assert!(actions.is_empty());
-            let lock = tc.inc_lock_ref(anchor, true);
+            let lock = tc.inc_lock_ref(anchor, ComponentSet::EMPTY);
             let params = DecLockRefParams {
+                node_id: None,
                 swa_uuid_for_lock: lock.swa_uuid_for_lock,
                 swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
-                mamba_lock_acquired: lock.mamba_lock_acquired,
+                skipped_lock_components: lock.skipped_lock_components,
             };
             tc.dec_lock_ref(anchor, &params, /* skip_swa = */ false);
             tc.finish_load_back(anchor);
@@ -4946,4 +4961,90 @@ fn recovered_swa_span_evicts_before_the_window_leaf() {
     assert!(tc.arena.has_device_value(leaf, SWA));
     assert!(tc.arena.has_device_value(leaf, FULL));
     tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn aux_release_refreshes_the_leaf_set_whatever_the_release_order() {
+    let mut tc = swa_core(/* window = */ 1, /* page_size = */ 1);
+    tc.insert(&insert_params_swa(&vec![1], &[10], 0, 0));
+    let leaf = child_of(&tc, tc.arena.root(), &[1]);
+    store_swa_device(&mut tc, leaf);
+    assert!(tc.evictable_device_leaves.contains(leaf));
+    let result = tc.inc_lock_ref(tc.arena.node(leaf).id, ComponentSet::EMPTY);
+    assert!(!tc.evictable_device_leaves.contains(leaf));
+    let params = DecLockRefParams {
+        node_id: result.node_id,
+        swa_uuid_for_lock: result.swa_uuid_for_lock,
+        swa_uuid_for_host_lock: None,
+        skipped_lock_components: ComponentSet::EMPTY,
+    };
+    // Full first: its walk still sees the SWA lock, so the leaf stays out.
+    crate::components::FullComponent
+        .release_component_lock(&mut tc, leaf, &params, /* lock_host = */ false);
+    assert!(!tc.evictable_device_leaves.contains(leaf));
+    // The SWA release drops the last lock and must readmit the leaf itself.
+    swa_component(1).release_component_lock(&mut tc, leaf, &params, /* lock_host = */ false);
+    assert!(tc.evictable_device_leaves.contains(leaf));
+}
+
+#[test]
+#[should_panic(expected = "lock receipt anchored on node")]
+fn dec_lock_ref_rejects_a_receipt_from_another_node() {
+    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
+    let [a, _b, c] = chain(&mut tc);
+    store_swa_device(&mut tc, c);
+    let result = tc.inc_lock_ref(tc.arena.node(c).id, ComponentSet::EMPTY);
+    let params = DecLockRefParams {
+        node_id: result.node_id,
+        swa_uuid_for_lock: result.swa_uuid_for_lock,
+        swa_uuid_for_host_lock: None,
+        skipped_lock_components: result.skipped_lock_components,
+    };
+    // Same receipt, wrong anchor: the walk would otherwise release a's
+    // segment, which this holder never locked.
+    tc.dec_lock_ref(tc.arena.node(a).id, &params, /* skip_swa = */ false);
+}
+
+#[test]
+#[should_panic(expected = "lock receipt anchored on node")]
+fn dec_host_lock_ref_rejects_a_receipt_from_another_node() {
+    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
+    let [a, _b, c] = chain(&mut tc);
+    set_swa_host(&mut tc, c);
+    tc.host_lru_list_mut(SWA).insert_mru(c);
+    let result = tc.inc_host_lock_ref(tc.arena.node(c).id);
+    let params = DecLockRefParams {
+        node_id: result.node_id,
+        swa_uuid_for_lock: None,
+        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
+        skipped_lock_components: ComponentSet::EMPTY,
+    };
+    tc.dec_host_lock_ref(tc.arena.node(a).id, &params);
+}
+
+#[test]
+fn receipt_anchor_follows_the_locked_node_through_a_split() {
+    let mut tc = swa_core(/* window = */ 1, /* page_size = */ 1);
+    tc.insert(&insert_params_swa(&vec![1, 2], &[10, 11], 0, 0));
+    let leaf = child_of(&tc, tc.arena.root(), &[1]);
+    store_swa_device(&mut tc, leaf);
+    let leaf_id = tc.arena.node(leaf).id;
+    let result = tc.inc_lock_ref(leaf_id, ComponentSet::EMPTY);
+    assert_eq!(result.node_id, Some(leaf_id));
+    // Diverge inside the node: the split keeps the id on the deeper half.
+    tc.insert(&insert_params_swa(&vec![1, 3], &[12, 13], 0, 0));
+    let params = DecLockRefParams {
+        node_id: result.node_id,
+        swa_uuid_for_lock: result.swa_uuid_for_lock,
+        swa_uuid_for_host_lock: None,
+        skipped_lock_components: ComponentSet::EMPTY,
+    };
+    tc.dec_lock_ref(leaf_id, &params, /* skip_swa = */ false);
+    assert_eq!(tc.arena.device_lock_ref(tc.arena.resolve(leaf_id), SWA), 0);
+}
+
+#[test]
+#[should_panic(expected = "swa_sliding_window_size must be positive")]
+fn new_panics_on_a_zero_sliding_window_size() {
+    SwaComponent::new(&swa_params_with_window(0));
 }

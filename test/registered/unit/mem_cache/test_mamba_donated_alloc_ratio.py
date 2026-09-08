@@ -188,7 +188,7 @@ class TestDecSwaLockSkip(unittest.TestCase):
     request's, on a shared FULL+SWA+MAMBA node (Inkling). Guards the contract
     without booting a 3-component model."""
 
-    def _run(self, mamba_lock_acquired):
+    def _run(self, skipped_lock_components):
         # internal-node priority: full=2 > swa=1 > mamba=0
         full = _RecordingComp(ComponentType.FULL, 2)
         swa = _RecordingComp(ComponentType.SWA, 1)
@@ -198,23 +198,24 @@ class TestDecSwaLockSkip(unittest.TestCase):
             components=(full, swa, mamba),
             components_by_type={ComponentType.SWA: swa},
             node_by_id=lambda node_id: node,
+            _assert_receipt_anchor=UnifiedTreeCore._assert_receipt_anchor,
         )
         UnifiedTreeCore.dec_swa_lock_only(
             tree_core,
             node.id,
-            DecLockRefParams(mamba_lock_acquired=mamba_lock_acquired),
+            DecLockRefParams(skipped_lock_components=skipped_lock_components),
         )
         return full, mamba
 
     def test_unlocked_mamba_is_not_released(self):
-        full, mamba = self._run(mamba_lock_acquired=False)
+        full, mamba = self._run(skipped_lock_components=(ComponentType.MAMBA,))
         # mamba took no lock at acquire, so the early release skips it too
         self.assertEqual(mamba.released, [])
         # full (above swa) is never touched
         self.assertEqual(full.released, [])
 
     def test_lower_tier_released_when_locked(self):
-        full, mamba = self._run(mamba_lock_acquired=True)
+        full, mamba = self._run(skipped_lock_components=())
         self.assertEqual(len(mamba.released), 1)
         self.assertEqual(full.released, [])
 

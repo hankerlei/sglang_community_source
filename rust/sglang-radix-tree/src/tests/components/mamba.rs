@@ -1,5 +1,5 @@
 use super::*;
-use crate::components::{FULL, MAMBA, SWA};
+use crate::components::{ComponentSet, FULL, MAMBA, SWA};
 use crate::test_utils::{accumulate_step, action_kinds};
 use crate::unified_lru_list::UnifiedLRUList;
 
@@ -300,9 +300,19 @@ fn device_lock_moves_the_slot_between_evictable_and_protected_once() {
     );
     assert_eq!(tc.protected_size_(MAMBA), 1);
     assert_eq!(tc.arena.node(a).device_lock_ref(MAMBA), 2);
-    mamba.release_component_lock(&mut tc, a, None, /* lock_host = */ false);
+    mamba.release_component_lock(
+        &mut tc,
+        a,
+        &DecLockRefParams::default(),
+        /* lock_host = */ false,
+    );
     assert_eq!(tc.protected_size_(MAMBA), 1);
-    mamba.release_component_lock(&mut tc, a, None, /* lock_host = */ false);
+    mamba.release_component_lock(
+        &mut tc,
+        a,
+        &DecLockRefParams::default(),
+        /* lock_host = */ false,
+    );
     assert_eq!(tc.evictable_size_(MAMBA), 1);
     assert_eq!(tc.protected_size_(MAMBA), 0);
     assert_eq!(tc.arena.node(a).device_lock_ref(MAMBA), 0);
@@ -313,9 +323,9 @@ fn lock_without_mamba_records_the_receipt_and_leaves_mamba_evictable() {
     let (mut tc, parent, leaf) = hybrid_lock_core();
     let leaf_handle = tc.arena.node(leaf).id;
 
-    let result = tc.inc_lock_ref(leaf_handle, /* lock_mamba = */ false);
+    let result = tc.inc_lock_ref(leaf_handle, ComponentSet::of(MAMBA));
 
-    assert!(!result.mamba_lock_acquired);
+    assert!(result.skipped_lock_components.contains(MAMBA));
     assert_eq!(tc.arena.node(parent).device_lock_ref(MAMBA), 0);
     assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 0);
     assert_eq!(tc.evictable_size_(MAMBA), 2);
@@ -326,7 +336,7 @@ fn lock_without_mamba_records_the_receipt_and_leaves_mamba_evictable() {
     // The receipt replays exactly what was taken: FULL only.
     let params = DecLockRefParams {
         swa_uuid_for_lock: result.swa_uuid_for_lock,
-        mamba_lock_acquired: result.mamba_lock_acquired,
+        skipped_lock_components: result.skipped_lock_components,
         ..Default::default()
     };
     tc.dec_lock_ref(leaf_handle, &params, /* skip_swa = */ false);
@@ -340,16 +350,16 @@ fn lock_without_mamba_records_the_receipt_and_leaves_mamba_evictable() {
 fn swa_only_release_spares_another_holders_mamba_lock() {
     let (mut tc, _parent, leaf) = hybrid_lock_core();
     let leaf_handle = tc.arena.node(leaf).id;
-    let owner = tc.inc_lock_ref(leaf_handle, /* lock_mamba = */ true);
-    let holder = tc.inc_lock_ref(leaf_handle, /* lock_mamba = */ false);
-    assert!(owner.mamba_lock_acquired);
-    assert!(!holder.mamba_lock_acquired);
+    let owner = tc.inc_lock_ref(leaf_handle, ComponentSet::EMPTY);
+    let holder = tc.inc_lock_ref(leaf_handle, ComponentSet::of(MAMBA));
+    assert!(!owner.skipped_lock_components.contains(MAMBA));
+    assert!(holder.skipped_lock_components.contains(MAMBA));
     assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 1);
 
     // The holder's early SWA release must not drop the owner's mamba lock.
     let holder_params = DecLockRefParams {
         swa_uuid_for_lock: holder.swa_uuid_for_lock,
-        mamba_lock_acquired: holder.mamba_lock_acquired,
+        skipped_lock_components: holder.skipped_lock_components,
         ..Default::default()
     };
     let mut device_frees = HashMap::new();
@@ -370,7 +380,7 @@ fn swa_only_release_spares_another_holders_mamba_lock() {
     assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 1);
     let owner_params = DecLockRefParams {
         swa_uuid_for_lock: owner.swa_uuid_for_lock,
-        mamba_lock_acquired: owner.mamba_lock_acquired,
+        skipped_lock_components: owner.skipped_lock_components,
         ..Default::default()
     };
     tc.dec_lock_ref(leaf_handle, &owner_params, /* skip_swa = */ false);
@@ -394,10 +404,10 @@ fn tombstone_lock_is_counted_with_no_ledger_move() {
     assert_eq!(tc.protected_size_(MAMBA), 0);
     // The paired release decrements the counted tombstone, ledger untouched.
     let params = DecLockRefParams {
-        mamba_lock_acquired: result.mamba_lock_acquired,
+        skipped_lock_components: result.skipped_lock_components,
         ..DecLockRefParams::default()
     };
-    mamba.release_component_lock(&mut tc, a, Some(&params), /* lock_host = */ false);
+    mamba.release_component_lock(&mut tc, a, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.node(a).device_lock_ref(MAMBA), 0);
     assert_eq!(tc.evictable_size_(MAMBA), 0);
 }
@@ -413,7 +423,12 @@ fn root_locks_are_noops() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    mamba.release_component_lock(&mut tc, root, None, /* lock_host = */ false);
+    mamba.release_component_lock(
+        &mut tc,
+        root,
+        &DecLockRefParams::default(),
+        /* lock_host = */ false,
+    );
     assert_eq!(tc.evictable_size_(MAMBA), 0);
 }
 
@@ -432,7 +447,12 @@ fn host_lock_detaches_and_reattaches_the_host_lru() {
     );
     assert!(!tc.host_lru_list(MAMBA).in_list(Some(a)));
     assert_eq!(tc.arena.node(a).host_lock_ref(MAMBA), 1);
-    mamba.release_component_lock(&mut tc, a, None, /* lock_host = */ true);
+    mamba.release_component_lock(
+        &mut tc,
+        a,
+        &DecLockRefParams::default(),
+        /* lock_host = */ true,
+    );
     assert!(tc.host_lru_list(MAMBA).in_list(Some(a)));
     assert_eq!(tc.arena.node(a).host_lock_ref(MAMBA), 0);
 }
@@ -450,7 +470,12 @@ fn host_unlock_skips_the_lru_for_device_backed_nodes() {
         IncLockRefResult::default(),
         /* lock_host = */ true,
     );
-    mamba.release_component_lock(&mut tc, a, None, /* lock_host = */ true);
+    mamba.release_component_lock(
+        &mut tc,
+        a,
+        &DecLockRefParams::default(),
+        /* lock_host = */ true,
+    );
     assert!(!tc.host_lru_list(MAMBA).in_list(Some(a)));
 }
 
@@ -1764,14 +1789,19 @@ fn release_after_a_restore_and_relock_keeps_the_other_lock() {
     assert_eq!(tc.evictable_size_(MAMBA), 0);
     assert_eq!(tc.protected_size_(MAMBA), 1);
     let params = DecLockRefParams {
-        mamba_lock_acquired: first.mamba_lock_acquired,
+        skipped_lock_components: first.skipped_lock_components,
         ..DecLockRefParams::default()
     };
-    mamba.release_component_lock(&mut tc, a, Some(&params), /* lock_host = */ false);
+    mamba.release_component_lock(&mut tc, a, &params, /* lock_host = */ false);
     // The first release takes back exactly its own ref.
     assert_eq!(tc.arena.node(a).device_lock_ref(MAMBA), 1);
     assert_eq!(tc.protected_size_(MAMBA), 1);
-    mamba.release_component_lock(&mut tc, a, None, /* lock_host = */ false);
+    mamba.release_component_lock(
+        &mut tc,
+        a,
+        &DecLockRefParams::default(),
+        /* lock_host = */ false,
+    );
     assert_eq!(tc.arena.node(a).device_lock_ref(MAMBA), 0);
     assert_eq!(tc.evictable_size_(MAMBA), 1);
     assert_eq!(tc.protected_size_(MAMBA), 0);

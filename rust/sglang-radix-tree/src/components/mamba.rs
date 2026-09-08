@@ -443,7 +443,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
-        params: Option<&DecLockRefParams>,
+        _params: &DecLockRefParams,
         lock_host: bool,
     ) {
         if tree_core.arena.node(node_id).is_root() {
@@ -456,14 +456,14 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 "Mamba release hit host_lock_ref=0 on node {node_id}"
             );
             node.dec_host_lock_ref(MAMBA);
-            if node.host_lock_ref(MAMBA) == 0
-                && !node.has_device_value(MAMBA)
-                && node.has_host_value(MAMBA)
-            {
-                let host_lru = tree_core.host_lru_list_mut(MAMBA);
-                if !host_lru.in_list(Some(node_id)) {
-                    host_lru.insert_mru(node_id);
+            if node.host_lock_ref(MAMBA) == 0 {
+                if !node.has_device_value(MAMBA) && node.has_host_value(MAMBA) {
+                    let host_lru = tree_core.host_lru_list_mut(MAMBA);
+                    if !host_lru.in_list(Some(node_id)) {
+                        host_lru.insert_mru(node_id);
+                    }
                 }
+                tree_core.update_evictable_leaf_sets_(node_id);
             }
             return;
         }
@@ -479,6 +479,9 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             tree_core.dec_protected_size(MAMBA, value_len);
         }
         tree_core.arena.dec_device_lock_ref(node_id, MAMBA);
+        if device_lock_ref == 1 {
+            tree_core.update_evictable_leaf_sets_(node_id);
+        }
     }
 
     /// Build the mamba transfer descriptors for the given phase.

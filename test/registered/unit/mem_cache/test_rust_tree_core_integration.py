@@ -721,8 +721,8 @@ def test_host_lock_refs_round_trip():
     _insert(core, [1], [10])
     leaf = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
     core.commit_backup(leaf, torch.tensor([100], dtype=torch.int64), {})
-    core.inc_host_lock_ref(leaf)
-    core.dec_host_lock_ref(leaf)
+    host_lock = core.inc_host_lock_ref(leaf)
+    core.dec_host_lock_ref(leaf, host_lock.to_dec_params())
     core.sanity_check([], [])
 
 
@@ -1051,11 +1051,6 @@ def test_swa_requires_the_sliding_window_size():
         )
 
 
-def test_swa_without_a_window_is_rejected_through_the_adapter():
-    with pytest.raises(ValueError, match="requires swa_sliding_window_size"):
-        _tree_core(tree_components=(ComponentType.FULL, ComponentType.SWA))
-
-
 def test_enable_hicache_constructs():
     mem_cache.RustUnifiedTreeCoreBinding(
         mem_cache.TreeCoreInitParamsBinding(enable_hicache=True),
@@ -1105,6 +1100,14 @@ def _swa_tree_core(window: int = 8, **params_overrides) -> RustUnifiedTreeCore:
         sliding_window_size=window,
         **params_overrides,
     )
+
+
+def test_swa_core_rejects_a_missing_or_non_positive_window():
+    """A zero window can never fill, so no boundary uuid would ever be stamped;
+    the adapter refuses it up front instead of letting the core misbehave later."""
+    for window in (None, 0, -1):
+        with pytest.raises(ValueError, match="positive sliding_window_size"):
+            _swa_tree_core(window=window)
 
 
 def test_write_back_load_back_ignores_auxiliary_nodes_for_pending_ownership():
@@ -1426,9 +1429,9 @@ def test_skipped_mamba_lock_survives_swa_only_release_through_the_adapter():
     node = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
 
     owner = core.inc_lock_ref(node)
-    holder = core.inc_lock_ref(node, lock_mamba=False)
-    assert owner.mamba_lock_acquired
-    assert not holder.mamba_lock_acquired
+    holder = core.inc_lock_ref(node, skip_lock_components=(ComponentType.MAMBA,))
+    assert ComponentType.MAMBA not in owner.skipped_lock_components
+    assert ComponentType.MAMBA in holder.skipped_lock_components
     assert core.mamba_protected_size() == 1
 
     # The holder's receipt says it never took mamba: its early SWA release

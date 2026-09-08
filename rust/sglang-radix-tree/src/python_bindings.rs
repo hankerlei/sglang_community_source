@@ -10,7 +10,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tch::{Device, Kind, Tensor};
 
-use crate::components::{ComponentType, FULL, MAMBA, SWA};
+use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA};
 use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeId, TreeCoreRuntimeError};
 use crate::unified_tree_core::KvCacheEvent;
@@ -642,26 +642,29 @@ impl InsertResultBinding {
 
 /// Python-visible dec-lock params; converts into DecLockRefParams.
 #[pyclass(get_all, set_all)]
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct DecLockRefParamsBinding {
+    pub node_id: Option<NodeId>,
     pub swa_uuid_for_lock: Option<i64>,
     pub swa_uuid_for_host_lock: Option<i64>,
-    pub mamba_lock_acquired: bool,
+    pub skipped_lock_components: Vec<u8>,
 }
 
 #[pymethods]
 impl DecLockRefParamsBinding {
     #[new]
-    #[pyo3(signature = (swa_uuid_for_lock = None, swa_uuid_for_host_lock = None, mamba_lock_acquired = false))]
+    #[pyo3(signature = (node_id = None, swa_uuid_for_lock = None, swa_uuid_for_host_lock = None, skipped_lock_components = Vec::new()))]
     fn new(
+        node_id: Option<NodeId>,
         swa_uuid_for_lock: Option<i64>,
         swa_uuid_for_host_lock: Option<i64>,
-        mamba_lock_acquired: bool,
+        skipped_lock_components: Vec<u8>,
     ) -> Self {
         DecLockRefParamsBinding {
+            node_id,
             swa_uuid_for_lock,
             swa_uuid_for_host_lock,
-            mamba_lock_acquired,
+            skipped_lock_components,
         }
     }
 }
@@ -670,32 +673,47 @@ impl DecLockRefParamsBinding {
     /// Convert into the tree core's dec-lock params.
     fn to_dec_lock_ref_params(&self) -> PyResult<DecLockRefParams> {
         Ok(DecLockRefParams {
+            node_id: self.node_id,
             swa_uuid_for_lock: self.swa_uuid_for_lock,
             swa_uuid_for_host_lock: self.swa_uuid_for_host_lock,
-            mamba_lock_acquired: self.mamba_lock_acquired,
+            skipped_lock_components: component_set_from_py(&self.skipped_lock_components)?,
         })
     }
 }
 
-/// Python-visible inc_lock_ref result; the receipt (boundary uuids +
-/// mamba_lock_acquired) is handed back to the matching dec_lock_ref.
+/// Python-visible inc_lock_ref result; the receipt (anchor node, boundary
+/// uuids, skipped components) is handed back to the matching dec_lock_ref.
 #[pyclass(get_all)]
 pub struct IncLockRefResultBinding {
     delta: Option<usize>,
+    node_id: Option<NodeId>,
     swa_uuid_for_lock: Option<i64>,
     swa_uuid_for_host_lock: Option<i64>,
-    mamba_lock_acquired: bool,
+    skipped_lock_components: Vec<u8>,
 }
 
 impl IncLockRefResultBinding {
     fn from_result(result: crate::unified_tree_core::IncLockRefResult) -> Self {
         Self {
             delta: result.delta,
+            node_id: result.node_id,
             swa_uuid_for_lock: result.swa_uuid_for_lock,
             swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-            mamba_lock_acquired: result.mamba_lock_acquired,
+            skipped_lock_components: result
+                .skipped_lock_components
+                .iter()
+                .map(|ct| ct.idx() as u8)
+                .collect(),
         }
     }
+}
+
+/// Parse Python component-type ids into a component set.
+fn component_set_from_py(component_types: &[u8]) -> PyResult<ComponentSet> {
+    component_types
+        .iter()
+        .map(|ct| parse_component_type(*ct))
+        .collect()
 }
 
 /// Convert a Python component-keyed tracker into the core's counts.
@@ -1060,14 +1078,16 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         cache_actions_to_py(py, actions)
     }
 
-    /// Bump the reference count on a node's component locks.
+    /// Bump the reference count on a node's component locks; the listed
+    /// components are left untaken and recorded in the receipt.
     fn inc_lock_ref(
         &self,
         py: Python<'_>,
         node_id: NodeId,
-        lock_mamba: bool,
+        skip_lock_components: Vec<u8>,
     ) -> PyResult<IncLockRefResultBinding> {
-        let result = py.allow_threads(|| self.core().inc_lock_ref(node_id, lock_mamba));
+        let skip = component_set_from_py(&skip_lock_components)?;
+        let result = py.allow_threads(|| self.core().inc_lock_ref(node_id, skip));
         Ok(IncLockRefResultBinding::from_result(result))
     }
 
@@ -1090,14 +1110,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         &self,
         py: Python<'_>,
         node_id: NodeId,
-        swa_uuid_for_lock: Option<i64>,
-        mamba_lock_acquired: bool,
+        params: &DecLockRefParamsBinding,
     ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
-        let params = DecLockRefParams {
-            swa_uuid_for_lock,
-            mamba_lock_acquired,
-            ..Default::default()
-        };
+        let params = params.to_dec_lock_ref_params()?;
         let (device_frees, host_frees) = py.allow_threads(|| {
             let mut device_frees = HashMap::new();
             let mut host_frees = HashMap::new();
@@ -1676,12 +1691,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     /// Bump the reference count on a node's host-side component locks.
     fn inc_host_lock_ref(&self, py: Python<'_>, node_id: NodeId) -> IncLockRefResultBinding {
         let result = py.allow_threads(|| self.core().inc_host_lock_ref(node_id));
-        IncLockRefResultBinding {
-            delta: result.delta,
-            swa_uuid_for_lock: result.swa_uuid_for_lock,
-            swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-            mamba_lock_acquired: result.mamba_lock_acquired,
-        }
+        IncLockRefResultBinding::from_result(result)
     }
 
     /// Decrease the reference count on a node's host-side component locks.
@@ -1689,10 +1699,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         &self,
         py: Python<'_>,
         node_id: NodeId,
-        params: Option<&DecLockRefParamsBinding>,
+        params: &DecLockRefParamsBinding,
     ) -> PyResult<()> {
-        let params = params.map(|p| p.to_dec_lock_ref_params()).transpose()?;
-        py.allow_threads(|| self.core().dec_host_lock_ref(node_id, params.as_ref()));
+        let params = params.to_dec_lock_ref_params()?;
+        py.allow_threads(|| self.core().dec_host_lock_ref(node_id, &params));
         Ok(())
     }
 
@@ -2275,14 +2285,14 @@ macro_rules! tree_core_binding {
             }
 
             /// Bump the reference count on a node's component locks.
-            #[pyo3(signature = (node_id, lock_mamba = true))]
+            #[pyo3(signature = (node_id, skip_lock_components = Vec::new()))]
             fn inc_lock_ref(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-                lock_mamba: bool,
+                skip_lock_components: Vec<u8>,
             ) -> PyResult<IncLockRefResultBinding> {
-                self.inner.inc_lock_ref(py, node_id, lock_mamba)
+                self.inner.inc_lock_ref(py, node_id, skip_lock_components)
             }
 
             /// Decrease the reference count on a node's component locks. The
@@ -2300,16 +2310,14 @@ macro_rules! tree_core_binding {
 
             /// Early-release the SWA portion of a request's tree lock; returns this
             /// release's per-component (device_frees, host_frees).
-            #[pyo3(signature = (node_id, swa_uuid_for_lock, mamba_lock_acquired))]
+            #[pyo3(signature = (node_id, params))]
             fn dec_swa_lock_only(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-                swa_uuid_for_lock: Option<i64>,
-                mamba_lock_acquired: bool,
+                params: &DecLockRefParamsBinding,
             ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
-                self.inner
-                    .dec_swa_lock_only(py, node_id, swa_uuid_for_lock, mamba_lock_acquired)
+                self.inner.dec_swa_lock_only(py, node_id, params)
             }
 
             /// Store a component's device value on a node (the SWA rebuild write-back).
@@ -2714,12 +2722,12 @@ macro_rules! tree_core_binding {
             }
 
             /// Decrease the reference count on a node's host-side component locks.
-            #[pyo3(signature = (node_id, params = None))]
+            /// The receipt is required, as for dec_lock_ref.
             fn dec_host_lock_ref(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-                params: Option<&DecLockRefParamsBinding>,
+                params: &DecLockRefParamsBinding,
             ) -> PyResult<()> {
                 self.inner.dec_host_lock_ref(py, node_id, params)
             }

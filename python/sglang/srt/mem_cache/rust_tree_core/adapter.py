@@ -152,9 +152,23 @@ def _cache_actions_from_tagged(actions: Sequence[tuple]) -> list[CacheAction]:
 def _inc_lock_ref_result_from_binding(result) -> IncLockRefResult:
     return IncLockRefResult(
         delta=result.delta,
+        node_id=result.node_id,
         swa_uuid_for_lock=result.swa_uuid_for_lock,
         swa_uuid_for_host_lock=result.swa_uuid_for_host_lock,
-        mamba_lock_acquired=result.mamba_lock_acquired,
+        skipped_lock_components=tuple(
+            ComponentType(ct) for ct in result.skipped_lock_components
+        ),
+    )
+
+
+def _dec_lock_ref_params_to_binding(bindings_module, params: DecLockRefParams):
+    """Build the binding's params from the module that owns the core's binding
+    (the inspection build is a distinct extension module with its own types)."""
+    return bindings_module.DecLockRefParamsBinding(
+        node_id=params.node_id,
+        swa_uuid_for_lock=params.swa_uuid_for_lock,
+        swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
+        skipped_lock_components=[int(ct) for ct in params.skipped_lock_components],
     )
 
 
@@ -313,6 +327,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             raise ValueError(
                 "Rust TreeCore does not support --radix-eviction-policy-config"
             )
+        if ComponentType.SWA in self.tree_components and (
+            params.sliding_window_size is None or params.sliding_window_size <= 0
+        ):
+            raise ValueError(
+                "the SWA tree component requires a positive sliding_window_size"
+            )
 
         self._page_size = params.page_size
         self.is_eagle = (
@@ -392,9 +412,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def inc_lock_ref(
         self,
         node_id: NodeId,
-        lock_mamba: bool = True,
+        skip_lock_components: Sequence[ComponentType] = (),
     ) -> IncLockRefResult:
-        result = self._binding.inc_lock_ref(node_id, lock_mamba)
+        result = self._binding.inc_lock_ref(
+            node_id, [int(ct) for ct in skip_lock_components]
+        )
         return _inc_lock_ref_result_from_binding(result)
 
     def dec_lock_ref(
@@ -403,12 +425,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         params: DecLockRefParams,
         skip_swa: bool = False,
     ) -> DecLockRefResult:
-        binding_params = self._bindings.DecLockRefParamsBinding(
-            swa_uuid_for_lock=params.swa_uuid_for_lock,
-            swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
-            mamba_lock_acquired=params.mamba_lock_acquired,
+        self._binding.dec_lock_ref(
+            node_id, _dec_lock_ref_params_to_binding(self._bindings, params), skip_swa
         )
-        self._binding.dec_lock_ref(node_id, binding_params, skip_swa)
         return DecLockRefResult()
 
     def dec_swa_lock_only(
@@ -418,7 +437,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> DecSwaLockOnlyResult:
         result = DecSwaLockOnlyResult()
         new_device_frees, new_host_frees = self._binding.dec_swa_lock_only(
-            node_id, params.swa_uuid_for_lock, params.mamba_lock_acquired
+            node_id, _dec_lock_ref_params_to_binding(self._bindings, params)
         )
         for component, tensors in new_device_frees.items():
             result.device_frees[ComponentType(component)].extend(tensors)
@@ -471,18 +490,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         return _inc_lock_ref_result_from_binding(result)
 
     def dec_host_lock_ref(
-        self, node_id: NodeId, params: Optional[DecLockRefParams] = None
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
-        binding_params = (
-            self._bindings.DecLockRefParamsBinding(
-                swa_uuid_for_lock=params.swa_uuid_for_lock,
-                swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
-                mamba_lock_acquired=params.mamba_lock_acquired,
-            )
-            if params is not None
-            else None
+        self._binding.dec_host_lock_ref(
+            node_id, _dec_lock_ref_params_to_binding(self._bindings, params)
         )
-        self._binding.dec_host_lock_ref(node_id, binding_params)
         return DecLockRefResult()
 
     def evictable_size(self) -> int:

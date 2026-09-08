@@ -235,10 +235,11 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def inc_lock_ref(
-        self, node_id: NodeId, lock_mamba: bool = True
+        self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
     ) -> IncLockRefResult:
-        """Bump the reference count on a node's component locks; lock_mamba=False
-        leaves the single-node mamba lock untaken (recorded in the result)."""
+        """Bump the reference count on a node's component locks. Components in
+        ``skip_lock_components`` are left untaken; the receipt records the
+        anchor node and the skipped set so the paired release mirrors them."""
         ...
 
     @abstractmethod
