@@ -990,8 +990,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.intermediate_size_per_partition = getattr(
             base_layer, "intermediate_size_per_partition", None
         )
+        # K3 sets gemm1_alpha (SiTU beta) but loads w1/w3 contiguously (gate_up_interleaved=False)
         self._uses_interleaved_gate_up = (
             getattr(base_layer.moe_runner_config, "gemm1_alpha", None) is not None
+            and getattr(base_layer.moe_runner_config, "gate_up_interleaved", True)
         )
 
         # Initialize triton_lora moe runner for batches with lora enabled
