@@ -413,6 +413,94 @@ class UnifiedRadixCache(BasePrefixCache):
         """Attach an external KV store directly to the device pools."""
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
+    def waiting_queue_prefetch_enabled(self) -> bool:
+        return self.linker is not None and self.linker.waiting_queue_prefetch_enabled()
+
+    def disable_waiting_queue_prefetch(self) -> None:
+        if self.linker is not None:
+            self.linker.disable_waiting_queue_prefetch()
+
+    def prefetch_external_linker_to_host(self, req) -> bool:
+        return self.linker is not None and self.linker.prefetch_to_host(req)
+
+    def get_external_linker_prefetch_state(self, rid: str) -> str:
+        if self.linker is None:
+            return "not_tracked"
+        return self.linker.get_host_prefetch_admission_state(rid)
+
+    def external_linker_prefetch_admission(self, rid: str) -> str:
+        return self.get_external_linker_prefetch_admission_states([rid]).get(
+            rid, "not_tracked"
+        )
+
+    def get_external_linker_prefetch_admission_states(
+        self, rids: Sequence[str]
+    ) -> dict[str, str]:
+        """Resolve differing rank-local queues in one fixed collective round."""
+        groups = []
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                groups.append(group)
+        if not groups and self.tp_world_size > 1:
+            groups.append(self.tp_group)
+
+        all_rids = list(dict.fromkeys(rids))
+        any_rids = torch.tensor([int(bool(all_rids))], dtype=torch.int)
+        self._all_reduce_attn_groups(any_rids, torch.distributed.ReduceOp.MAX)
+        if not bool(any_rids.item()):
+            return {}
+
+        for group in groups:
+            gathered = [None] * torch.distributed.get_world_size(group=group)
+            torch.distributed.all_gather_object(gathered, all_rids, group=group)
+            all_rids = sorted(
+                {rid for rank_rids in gathered for rid in rank_rids}
+            )
+        if not all_rids:
+            return {}
+
+        names = (
+            "not_tracked",
+            "pending",
+            "dfs_prefetched",
+            "no_prefetch_needed",
+            "terminal",
+        )
+        local_states = [
+            self.get_external_linker_prefetch_state(rid) for rid in all_rids
+        ]
+        counts = torch.tensor(
+            [
+                [int(local_state == name) for name in names]
+                for local_state in local_states
+            ],
+            dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(counts, torch.distributed.ReduceOp.SUM)
+
+        def resolve(row) -> str:
+            not_tracked, pending, dfs_ready, memory_ready, terminal = (
+                int(value) for value in row
+            )
+            if pending:
+                return "pending"
+            completed = dfs_ready + memory_ready
+            if terminal or (not_tracked and completed):
+                return "terminal"
+            if dfs_ready:
+                return "dfs_prefetched"
+            if memory_ready:
+                return "no_prefetch_needed"
+            if not_tracked:
+                return "not_tracked"
+            return "terminal"
+
+        return {rid: resolve(counts[index]) for index, rid in enumerate(all_rids)}
+
+    def cancel_external_linker_prefetch(self, rid: str) -> None:
+        if self.linker is not None:
+            self.linker.cancel_waiting_queue_prefetch(rid)
+
     def reset(self) -> None:
         if self.linker is not None:
             self.linker.reset()

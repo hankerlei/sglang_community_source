@@ -613,6 +613,11 @@ class Scheduler(
         )
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self.enable_waiting_queue_dfs_prefetch = bool(
+            self.enable_unified_cache_external_linker
+            and get_memory().mooncake_enable_waiting_queue_dfs_prefetch
+            and self.tree_cache.waiting_queue_prefetch_enabled()
+        )
         if self.enable_hierarchical_cache:
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
@@ -3340,6 +3345,11 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
+        if self.enable_waiting_queue_dfs_prefetch:
+            # match_prefix has already recorded the direct-L3 hit. Submission
+            # only publishes immutable metadata; Mooncake workers own session
+            # creation and DFS I/O.
+            self.tree_cache.prefetch_external_linker_to_host(req)
         if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
@@ -4087,6 +4097,16 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
+        waiting_queue_prefetch_states = {}
+        if self.enable_waiting_queue_dfs_prefetch:
+            # Resolve the whole request-id union before any rank-local budget
+            # or LoRA branch can change collective order.
+            waiting_queue_prefetch_states = (
+                self.tree_cache.get_external_linker_prefetch_admission_states(
+                    [req.rid for req in self.waiting_queue]
+                )
+            )
+
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
@@ -4208,6 +4228,15 @@ class Scheduler(
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
+
+            if self.enable_waiting_queue_dfs_prefetch:
+                prefetch_admission = waiting_queue_prefetch_states.get(
+                    req.rid, "not_tracked"
+                )
+                if prefetch_admission == "pending":
+                    continue
+                if prefetch_admission == "terminal":
+                    self.tree_cache.cancel_external_linker_prefetch(req.rid)
 
             # A forward batch runs one pooling mode, so setwise readout requests
             # (token_indices_to_pool) cannot share a batch with last-token ones.

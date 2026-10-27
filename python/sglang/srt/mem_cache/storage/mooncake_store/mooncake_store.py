@@ -407,7 +407,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return total
 
     def __init__(
-        self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
+        self,
+        storage_config: HiCacheStorageConfig = None,
+        mem_pool: HostKVCache = None,
+        enable_dfs_prefetch: Optional[bool] = None,
     ):
         MooncakeBaseStore.__init__(self)
         self.dcp_size = storage_config.dcp_size if storage_config is not None else 1
@@ -420,6 +423,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self._supports_session_ids = self._replicate_config_supports("session_ids")
         try:
             self.store = MooncakeDistributedStore()
+            if enable_dfs_prefetch is True and not callable(
+                getattr(self.store, "disable_dfs_prefetch", None)
+            ):
+                raise RuntimeError(
+                    "Waiting-queue DFS prefetch requires Mooncake with "
+                    "disable_dfs_prefetch support. Rebuild/install the updated "
+                    "Mooncake package."
+                )
 
             self.config = self._load_config(storage_config)
             extra_config = (
@@ -542,6 +553,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     transfer_engine = None
 
                 setup_kwargs = {}
+                if enable_dfs_prefetch is False:
+                    setup_kwargs["enable_dfs_prefetch"] = False
                 if self.config.enable_ssd_offload:
                     setup_kwargs["enable_ssd_offload"] = True
                 if self.config.ssd_offload_path is not None:
@@ -584,6 +597,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         ]
                         if not unsupported_kwargs:
                             raise
+                        if "enable_dfs_prefetch" in unsupported_kwargs:
+                            raise RuntimeError(
+                                "The installed Mooncake package cannot disable "
+                                "DFS prefetch per client. Rebuild/install the "
+                                "updated package to honor the SGLang setting."
+                            ) from e
                         if "tenant_id" in unsupported_kwargs:
                             raise RuntimeError(
                                 "The installed Mooncake version does not support "
@@ -1027,6 +1046,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys: List[str],
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        *,
+        query_all_pp: bool = False,
     ) -> PoolTransferResult:
         if self.mem_pool_host.kv_buffer is None:
             # Logical anchor: no physical KV object exists in Mooncake, so the
@@ -1051,6 +1072,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
+            if query_all_pp and self.pp_size > 1:
+                # Direct-linker object names contain an explicit PP rank. A
+                # prefix is usable only when every pipeline stage can restore
+                # the same logical page.
+                component_keys = [
+                    key.replace(f"_pp{self.pp_rank}_", f"_pp{pp_rank}_")
+                    for key in component_keys
+                    for pp_rank in range(self.pp_size)
+                ]
+                key_multiplier *= self.pp_size
             component_keys = self._tag_keys(component_keys)
             start = len(all_component_keys)
             all_component_keys.extend(component_keys)

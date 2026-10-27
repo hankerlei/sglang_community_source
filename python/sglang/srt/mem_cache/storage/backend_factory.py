@@ -183,7 +183,10 @@ class StorageBackendFactory:
         elif backend_name == "nixl":
             return backend_class(storage_config)
         elif backend_name == "mooncake":
-            backend = backend_class(storage_config, mem_pool_host)
+            # Ordinary HiCache does not use DirectLinker's waiting-queue arena.
+            backend = backend_class(
+                storage_config, mem_pool_host, enable_dfs_prefetch=False
+            )
             return backend
         elif backend_name == "npu_memcache":
             backend = backend_class(storage_config, mem_pool_host)
