@@ -41,6 +41,9 @@ class FakeMooncakeDistributedStore:
     def register_buffer(self, *args, **kwargs):
         return 0
 
+    def disable_dfs_prefetch(self):
+        return True
+
     def put(self, key, value, *args):
         self.objects[key] = value
         return 0
@@ -89,6 +92,36 @@ def _make_storage_config(tenant_id=DEFAULT_TENANT_ID):
 
 
 class TestMooncakeTenantConfig(unittest.TestCase):
+    def test_disabled_prefetch_is_forwarded_to_native_setup(self):
+        FakeMooncakeDistributedStore.instances = []
+        with patch.dict(
+            "sys.modules", _fake_mooncake_modules(FakeMooncakeDistributedStore)
+        ):
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                MooncakeStore,
+            )
+
+            MooncakeStore(_make_storage_config(), enable_dfs_prefetch=False)
+        self.assertIs(
+            FakeMooncakeDistributedStore.instances[-1].setup_calls[0][1][
+                "enable_dfs_prefetch"
+            ],
+            False,
+        )
+
+    def test_enabled_prefetch_requires_native_release_api(self):
+        class MissingReleaseStore(FakeMooncakeDistributedStore):
+            instances = []
+            disable_dfs_prefetch = None
+
+        with patch.dict("sys.modules", _fake_mooncake_modules(MissingReleaseStore)):
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                MooncakeStore,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "disable_dfs_prefetch"):
+                MooncakeStore(_make_storage_config(), enable_dfs_prefetch=True)
+
     def test_mooncake_store_forwards_non_default_tenant_id(self):
         FakeMooncakeDistributedStore.instances = []
         with patch.dict(
