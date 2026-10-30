@@ -28,7 +28,11 @@ from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
-DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
+DEFAULT_LOCAL_BUFFER_SIZE = int(
+    os.environ.get("SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE", 16 * 1024 * 1024)
+)
+if DEFAULT_LOCAL_BUFFER_SIZE <= 0:
+    raise ValueError("SGLANG_MOONCAKE_LOCAL_BUFFER_SIZE must be positive")
 SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
 
@@ -98,6 +102,28 @@ def _normalize_tenant_id(value) -> str:
         return DEFAULT_TENANT_ID
     tenant_id = str(value).strip()
     return tenant_id if tenant_id else DEFAULT_TENANT_ID
+
+
+def _get_mooncake_client_http_port(dp_rank: Optional[int] = None) -> int:
+    """Return a metrics port unique to this physical scheduler process."""
+    base_port = envs.MOONCAKE_CLIENT_METRICS_PORT_BASE.get()
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        global_rank = torch.distributed.get_rank()
+        if dp_rank is not None:
+            global_rank += dp_rank * torch.distributed.get_world_size()
+        return base_port + global_rank
+    return base_port + (dp_rank or 0)
+
+
+def _get_mooncake_client_http_setup_kwargs(
+    enable_client_http_server: bool, dp_rank: Optional[int] = None
+) -> dict[str, Any]:
+    if not enable_client_http_server:
+        return {}
+    return {
+        "enable_client_http_server": True,
+        "client_http_port": _get_mooncake_client_http_port(dp_rank),
+    }
 
 
 @dataclass
@@ -407,7 +433,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return total
 
     def __init__(
-        self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
+        self,
+        storage_config: HiCacheStorageConfig = None,
+        mem_pool: HostKVCache = None,
+        enable_client_http_server: Optional[bool] = None,
     ):
         MooncakeBaseStore.__init__(self)
         self.dcp_size = storage_config.dcp_size if storage_config is not None else 1
@@ -427,6 +456,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            if enable_client_http_server is None:
+                enable_client_http_server = bool(
+                    getattr(storage_config, "enable_storage_metrics", False)
+                )
             self.enable_group_semantics = bool(
                 extra_config.get("enable_group_semantics", False)
                 if extra_config
@@ -541,7 +574,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     client_hostname = self.config.local_hostname
                     transfer_engine = None
 
-                setup_kwargs = {}
+                setup_kwargs = _get_mooncake_client_http_setup_kwargs(
+                    enable_client_http_server,
+                    getattr(storage_config, "dp_rank", None),
+                )
                 if self.config.enable_ssd_offload:
                     setup_kwargs["enable_ssd_offload"] = True
                 if self.config.ssd_offload_path is not None:
@@ -1650,9 +1686,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             config.session_ids = session_ids
 
         if self._uses_multi_buffer(buffer_ptrs):
-            config = config or self._replicate_config_cls()
+            if config is not None:
+                return self.store.batch_put_from_multi_buffers(
+                    key_strs, buffer_ptrs, buffer_sizes, config
+                )
             return self.store.batch_put_from_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes, config
+                key_strs, buffer_ptrs, buffer_sizes
             )
         elif config is not None:
             return self.store.batch_put_from(
