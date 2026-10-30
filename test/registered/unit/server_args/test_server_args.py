@@ -2715,6 +2715,18 @@ class TestHiCacheArgs(CustomTestCase):
 
         handle_cache_compatibility(args)
 
+    def test_external_linker_rejects_disabled_radix_cache(self):
+        args = self._make_args(
+            enable_unified_cache_external_linker=True,
+            disable_radix_cache=True,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "--enable-unified-cache-external-linker requires the default",
+        ):
+            handle_cache_compatibility(args)
+
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):

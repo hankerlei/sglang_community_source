@@ -74,6 +74,8 @@ class CacheInitParams:
     # Draft KV pools that share the target KV slots but are stored apart from it.
     sidecar_draft_device_pools: tuple[object, ...] = ()
     mtp_draft_mamba_pools: tuple[object, ...] = ()
+    # Regular DP launches one independent TP/PP world per rank.
+    dp_rank: Optional[int] = None
 
     @property
     def tree_components(self) -> Optional[tuple[ComponentType, ...]]:

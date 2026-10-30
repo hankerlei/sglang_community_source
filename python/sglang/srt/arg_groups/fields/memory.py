@@ -258,6 +258,18 @@ class Memory(msgspec.Struct):
         bool,
         "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",
     ] = False
+    mooncake_page_wise_load_threshold: A[
+        int,
+        "Minimum number of Mooncake direct-linker keys that switches loading from layer-wise to complete-page flow.",
+    ] = 10
+    mooncake_page_wise_load_batch_size: A[
+        int,
+        "Maximum number of keys in one complete-page Mooncake direct-linker read call.",
+    ] = 128
+    mooncake_enable_page_wise_load: A[
+        bool,
+        "Enable page-wise loading for Mooncake direct-linker when the key threshold is reached.",
+    ] = False
     unified_cache_external_linker_backend: A[
         str,
         Arg(
