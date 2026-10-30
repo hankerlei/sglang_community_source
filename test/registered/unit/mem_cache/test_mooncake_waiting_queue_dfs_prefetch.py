@@ -1,9 +1,10 @@
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
 )
@@ -37,12 +38,107 @@ def _linker():
     linker.session_refcounts = {}
     linker.session_sources = {}
     linker.session_lease_base = {}
+    linker.session_refresh_age_s = 0.0
     linker.host_prefetch_entries = {}
     linker.storage = SimpleNamespace(store=MagicMock())
     return linker
 
 
 class TestWaitingQueueDfsPrefetch(unittest.TestCase):
+    def test_group_semantics_disables_refresh_skip(self):
+        linker = _linker()
+        linker.session_refresh_age_s = 5.0
+        linker.storage._can_use_group_semantics = lambda: True
+
+        with self.assertLogs(level="WARNING"):
+            linker._disable_refresh_skip_for_groups()
+
+        self.assertEqual(linker.session_refresh_age_s, 0.0)
+
+    def test_private_session_refreshes_only_after_age_threshold(self):
+        linker = _linker()
+        linker.session_refresh_age_s = 5.0
+        linker.prepared_load_sessions["prefetch"] = ["key"]
+        linker.session_refcounts["key"] = 1
+        linker.session_lease_base["key"] = 100.0
+        linker.host_prefetch_entries["r"] = {
+            "state": "dfs_prefetched",
+            "session_rid": "prefetch",
+        }
+        linker.storage.store.batch_get_session_refresh.return_value = [0]
+
+        with patch.object(mooncake_direct_linker.time, "monotonic", return_value=104.9):
+            self.assertTrue(linker.revalidate_host_prefetch("r"))
+        linker.storage.store.batch_get_session_refresh.assert_not_called()
+        with patch.object(mooncake_direct_linker.time, "monotonic", return_value=105.0):
+            self.assertTrue(linker.revalidate_host_prefetch("r"))
+        linker.storage.store.batch_get_session_refresh.assert_called_once_with(["key"])
+
+    def test_shared_session_refresh_failure_cannot_be_admitted(self):
+        linker = _linker()
+        linker.session_refresh_age_s = 5.0
+        linker.prepared_load_sessions["prefetch"] = ["key"]
+        linker.session_refcounts["key"] = 2
+        linker.session_lease_base["key"] = 100.0
+        linker.host_prefetch_entries["r"] = {
+            "state": "dfs_prefetched",
+            "session_rid": "prefetch",
+        }
+        linker.storage.store.batch_get_session_refresh.return_value = [7]
+
+        with patch.object(mooncake_direct_linker.time, "monotonic", return_value=101.0):
+            self.assertFalse(linker.revalidate_host_prefetch("r"))
+        self.assertNotIn("key", linker.session_lease_base)
+
+    def test_revalidation_error_fails_closed(self):
+        linker = _linker()
+        linker.pool_group = SimpleNamespace(
+            resolve_transfers=lambda transfers, **kwargs: transfers
+        )
+        linker.storage._get_hybrid_page_component_keys = lambda keys, transfer: (
+            keys,
+            1,
+        )
+        linker.storage._tag_keys = lambda keys: list(keys)
+        linker.storage.pp_size = 1
+        linker.storage._batch_exist = MagicMock(side_effect=RuntimeError("unavailable"))
+
+        with self.assertLogs(level="ERROR"):
+            self.assertFalse(
+                linker.revalidate_load([PoolTransfer(name=PoolName.KV, keys=["key"])])
+            )
+
+        linker.storage._batch_exist = lambda keys: []
+        with self.assertLogs(level="WARNING"):
+            self.assertFalse(
+                linker.revalidate_load([PoolTransfer(name=PoolName.KV, keys=["key"])])
+            )
+
+    def test_borrowed_session_is_ended_after_native_read(self):
+        linker = _linker()
+        linker.num_layers = 0
+        linker.layer_done_counter = SimpleNamespace(fail=MagicMock())
+        linker.pools = {
+            PoolName.KV: SimpleNamespace(prepare_locations=lambda indices: [])
+        }
+        linker.storage._get_hybrid_page_component_keys = lambda keys, transfer: (
+            keys,
+            1,
+        )
+        linker.storage._tag_keys = lambda keys: list(keys)
+        linker.prepared_load_sessions["r"] = ["key"]
+        linker.session_refcounts["key"] = 1
+        linker.session_sources["key"] = "dfs"
+
+        linker.load_layer_wise(
+            0, [("r", [PoolTransfer(name=PoolName.KV, keys=["key"])])]
+        )
+
+        linker.storage.store.batch_get_session_start.assert_not_called()
+        linker.storage.store.batch_get_session_end.assert_called_once_with(["key"])
+        self.assertEqual(linker.prepared_load_sessions, {})
+        linker.layer_done_counter.fail.assert_not_called()
+
     def test_claim_moves_session_atomically(self):
         linker = _linker()
         linker.prepared_load_sessions["prefetch"] = ["a", "b"]
@@ -116,8 +212,9 @@ class TestWaitingQueueDfsPrefetch(unittest.TestCase):
         linker.pool_group = SimpleNamespace(
             resolve_transfers=lambda transfers, **kwargs: transfers
         )
-        linker.storage._get_hybrid_page_component_keys = (
-            lambda keys, transfer: ([f"{key}_component" for key in keys], 1)
+        linker.storage._get_hybrid_page_component_keys = lambda keys, transfer: (
+            [f"{key}_component" for key in keys],
+            1,
         )
         linker.storage._tag_keys = lambda keys: [f"tenant/{key}" for key in keys]
         linker.storage._batch_exist = lambda keys: [1, 0]
@@ -138,11 +235,9 @@ class TestWaitingQueueDfsPrefetch(unittest.TestCase):
         store.mem_pool_host = SimpleNamespace(kv_buffer=None)
         store.pp_rank = 0
         store.pp_size = 2
-        store._get_hybrid_page_component_keys = (
-            lambda keys, transfer: (
-                [f"{key}_cp0_pp0_{transfer.name}" for key in keys],
-                1,
-            )
+        store._get_hybrid_page_component_keys = lambda keys, transfer: (
+            [f"{key}_cp0_pp0_{transfer.name}" for key in keys],
+            1,
         )
         store._tag_keys = lambda keys: keys
         store._batch_exist = lambda keys: [

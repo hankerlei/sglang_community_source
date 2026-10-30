@@ -608,12 +608,8 @@ class UnifiedCacheLinkerWrapper:
             construction = torch.tensor(
                 [int(constructed), int(locally_prefetched)], dtype=torch.int
             )
-            cache._all_reduce_attn_groups(
-                construction, torch.distributed.ReduceOp.MIN
-            )
-            constructed, prefetched = (
-                bool(value) for value in construction.tolist()
-            )
+            cache._all_reduce_attn_groups(construction, torch.distributed.ReduceOp.MIN)
+            constructed, prefetched = (bool(value) for value in construction.tolist())
             if locally_prefetched and not prefetched:
                 self.cache_linker.cancel_host_prefetch(req.rid)
 
@@ -668,8 +664,39 @@ class UnifiedCacheLinkerWrapper:
                 )
                 return 0, req.last_node
 
+        # With waiting-queue prefetch enabled, ordinary hits also need a live
+        # native session before admission. Otherwise the master may evict a
+        # match-time hit before the asynchronous layer-wise reader starts.
+        if self._waiting_queue_prefetch_enabled and not prefetched:
+            try:
+                locally_prepared = self.cache_linker.prepare_load(
+                    req.rid, [transfer for _, transfer in component_transfers]
+                )
+            except BaseException:
+                logger.warning(
+                    "External-linker load session preparation failed for rid=%s",
+                    req.rid,
+                    exc_info=True,
+                )
+                locally_prepared = False
+            prepared = torch.tensor(int(locally_prepared), dtype=torch.int)
+            cache._all_reduce_attn_groups(prepared, torch.distributed.ReduceOp.MIN)
+            if not bool(prepared.item()):
+                self.cache_linker.abort_prepared_load(req.rid)
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT,
+                    req,
+                    component_transfers,
+                    prefix_len,
+                )
+                return 0, req.last_node
+
         revalidate = getattr(self.cache_linker, "revalidate_load", None)
-        if not prefetched and revalidate is not None:
+        if (
+            not prefetched
+            and not self._waiting_queue_prefetch_enabled
+            and revalidate is not None
+        ):
             locally_valid = revalidate(
                 [transfer for _, transfer in component_transfers]
             )
@@ -694,25 +721,32 @@ class UnifiedCacheLinkerWrapper:
                 req.rid, [transfer for _, transfer in component_transfers]
             )
         except BaseException:
-            if prefetched:
+            if self._waiting_queue_prefetch_enabled:
                 self.cache_linker.abort_prepared_load(req.rid)
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
             )
             raise
         if not queued:
-            if prefetched:
+            if self._waiting_queue_prefetch_enabled:
                 self.cache_linker.abort_prepared_load(req.rid)
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
             )
             return 0, req.last_node
-        self._update_load(
-            ExternalLinkerLoadPhase.PREPARE,
-            req,
-            component_transfers,
-            prefix_len,
-        )
+        try:
+            self._update_load(
+                ExternalLinkerLoadPhase.PREPARE,
+                req,
+                component_transfers,
+                prefix_len,
+            )
+        except BaseException:
+            # The queued reader has not started; do not strand its lease if
+            # a component rejects the request-side PREPARE transition.
+            self.cache_linker.cancel_queued_load(req.rid)
+            self.cache_linker.abort_prepared_load(req.rid)
+            raise
 
         # Components omitted from the linker do not run their PREPARE hook.
         # Keep a non-restorable SWA range as tombstones instead of rebuilding

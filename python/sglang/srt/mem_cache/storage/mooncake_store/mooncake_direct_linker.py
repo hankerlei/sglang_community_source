@@ -69,6 +69,9 @@ def _storage_suffix(
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
+    # Unit-test fixtures may construct an instance without running __init__.
+    session_refresh_age_s = 0.0
+
     def __init__(
         self,
         server_args,
@@ -195,6 +198,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.session_refresh_age_s = (
             _session_refresh_age_config() if self.host_prefetch_enabled else 0.0
         )
+        self._disable_refresh_skip_for_groups()
         self.session_lock = threading.Lock()
         self.host_prefetch_lock = threading.Lock()
         self.host_prefetch_entries: dict[str, dict[str, object]] = {}
@@ -211,16 +215,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         worker_count = max(
             1,
-            int(
-                getattr(
-                    server_args, "mooncake_waiting_queue_dfs_prefetch_workers", 2
-                )
-            ),
+            int(getattr(server_args, "mooncake_waiting_queue_dfs_prefetch_workers", 2)),
         )
         self.host_prefetch_worker_count = min(worker_count, self.host_prefetch_limit)
-        self.host_prefetch_queue: Queue[
-            tuple[str, list[PoolTransfer]] | None
-        ] = Queue()
+        self.host_prefetch_queue: Queue[tuple[str, list[PoolTransfer]] | None] = Queue()
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
@@ -313,6 +311,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def waiting_queue_prefetch_enabled(self) -> bool:
         return self.host_prefetch_enabled
 
+    def _disable_refresh_skip_for_groups(self) -> None:
+        group_semantics = getattr(self.storage, "_can_use_group_semantics", None)
+        if (
+            self.session_refresh_age_s > 0
+            and callable(group_semantics)
+            and group_semantics()
+        ):
+            # A grouped object's reported TTL can exceed its remaining lease.
+            logger.warning(
+                "SGLANG_MOONCAKE_SESSION_REFRESH_AGE_S is ignored with "
+                "Mooncake group semantics"
+            )
+            self.session_refresh_age_s = 0.0
+
     def disable_waiting_queue_prefetch(self) -> None:
         if self.host_prefetch_enabled and not self.storage.store.disable_dfs_prefetch():
             raise RuntimeError(
@@ -382,9 +394,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         ).lower()
                         self.session_lease_base[key] = lease_base
                         acquired.append(key)
-                if len(results) != len(new_keys) or any(
-                    code != 0 for code in results
-                ):
+                if len(results) != len(new_keys) or any(code != 0 for code in results):
                     self._rollback_session_refs_locked(acquired)
                     return False
                 self.prepared_load_sessions[rid] = acquired
@@ -556,9 +566,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         rid,
                         exc_info=True,
                     )
-                    self._finish_host_prefetch(
-                        rid, entry, session_rid, "failed"
-                    )
+                    self._finish_host_prefetch(rid, entry, session_rid, "failed")
                     continue
                 with self.session_lock:
                     keys = list(self.prepared_load_sessions.get(session_rid, ()))
@@ -717,9 +725,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 )
                 if self.storage.pp_size > 1:
                     component_keys = [
-                        key.replace(
-                            f"_pp{self.storage.pp_rank}_", f"_pp{pp_rank}_"
-                        )
+                        key.replace(f"_pp{self.storage.pp_rank}_", f"_pp{pp_rank}_")
                         for key in component_keys
                         for pp_rank in range(self.storage.pp_size)
                     ]
@@ -728,13 +734,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 return True
             states = list(self.storage._batch_exist(keys))
         except BaseException:
-            # Preserve the established fail-soft behavior for an existence
-            # service error; the actual load remains authoritative.
             logger.exception("Mooncake direct-linker load revalidation error")
-            return True
-        missing = [key for key, state in zip(keys, states) if state != 1]
+            return False
         if len(states) != len(keys):
-            missing.extend(keys[len(states) :])
+            logger.warning(
+                "Mooncake load revalidation returned %d results for %d keys",
+                len(states),
+                len(keys),
+            )
+            return False
+        missing = [key for key, state in zip(keys, states) if state != 1]
         if not missing:
             return True
         logger.warning(
@@ -884,6 +893,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             for rid, transfers in request_transfers:
                 with self.session_lock:
                     borrowed = rid in self.prepared_load_sessions
+                if self.host_prefetch_enabled and not borrowed:
+                    raise RuntimeError(
+                        f"Mooncake load admitted without a prepared session: rid={rid}"
+                    )
                 if borrowed:
                     borrowed_rids.append(rid)
                 for transfer in transfers:
