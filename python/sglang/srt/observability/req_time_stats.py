@@ -708,6 +708,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     prefill_finished_time: float = 0.0
     completion_time: float = 0.0
 
+    # Why the request remained in the scheduler waiting queue.
+    queue_wait_reason: str = ""
+    queue_wait_reason_start_time: float = 0.0
+    track_queue_wait_reasons: bool = False
+    queue_reason_durations: Optional[Dict[str, float]] = None
+    queue_reason_checks: Optional[Dict[str, int]] = None
+
     # prefill node, get by time.perf_counter()
     prefill_bootstrap_queue_entry_time: float = 0.0
     prefill_transfer_queue_entry_time: float = 0.0
@@ -769,6 +776,40 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         calibrate_time_diff()
         ts = ts or time.perf_counter()
         self.scheduler_recv_time = ts
+
+    def set_queue_wait_reason(self, reason: str, ts=None):
+        """Attribute queue residence time to the latest admission blocker."""
+        if not self.track_queue_wait_reasons:
+            return
+        ts = ts or time.perf_counter()
+        if self.queue_reason_checks is None:
+            self.queue_reason_checks = {}
+        self.queue_reason_checks[reason] = self.queue_reason_checks.get(reason, 0) + 1
+        if reason == self.queue_wait_reason:
+            return
+        if self.queue_wait_reason and self.queue_wait_reason_start_time > 0.0:
+            elapsed = max(0.0, ts - self.queue_wait_reason_start_time)
+            if self.queue_reason_durations is None:
+                self.queue_reason_durations = {}
+            self.queue_reason_durations[self.queue_wait_reason] = (
+                self.queue_reason_durations.get(self.queue_wait_reason, 0.0) + elapsed
+            )
+        self.queue_wait_reason = reason
+        self.queue_wait_reason_start_time = ts
+
+    def finish_queue_wait_reason(self, ts=None):
+        if not self.track_queue_wait_reasons:
+            return
+        ts = ts or time.perf_counter()
+        if self.queue_wait_reason and self.queue_wait_reason_start_time > 0.0:
+            elapsed = max(0.0, ts - self.queue_wait_reason_start_time)
+            if self.queue_reason_durations is None:
+                self.queue_reason_durations = {}
+            self.queue_reason_durations[self.queue_wait_reason] = (
+                self.queue_reason_durations.get(self.queue_wait_reason, 0.0) + elapsed
+            )
+        self.queue_wait_reason = ""
+        self.queue_wait_reason_start_time = 0.0
 
     def set_spec_draft_start_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -836,7 +877,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def set_wait_queue_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
-        if self.wait_queue_entry_time == 0.0:
+        first_entry = self.wait_queue_entry_time == 0.0
+        if first_entry:
             if self.enable_metrics and self.disagg_mode != DisaggregationMode.DECODE:
                 self.storage_prefetch_wait_s = 0.0
                 self.storage_staging_wait_s = 0.0
@@ -859,9 +901,15 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             self.set_retract_time(ts)
 
         self.wait_queue_entry_time = ts
+        if self.track_queue_wait_reasons:
+            self.set_queue_wait_reason(
+                "awaiting_scheduler_check" if first_entry else "retracted", ts
+            )
 
     def set_forward_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
+        if self.track_queue_wait_reasons:
+            self.finish_queue_wait_reason(ts)
         if self.forward_entry_time == 0.0:
             self.forward_entry_time = ts
             self.last_forward_entry_time = ts

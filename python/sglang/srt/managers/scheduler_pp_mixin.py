@@ -42,6 +42,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.observability.forward_pass_metrics import FpmTiming
 
+_PP_LINKER_FAILURES_KEY = "__linker_failed_rids__"
+
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
@@ -152,6 +154,7 @@ class SchedulerPPMixin:
                 self.running_mbs[mb_id] = self.running_batch
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
+                linker_failed_rids = set()
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
@@ -199,6 +202,15 @@ class SchedulerPPMixin:
                         self._pp_process_batch_result(
                             process_target,
                             next_batch_result,
+                            linker_failed_rids=(
+                                set(
+                                    next_pp_outputs.tensors.get(
+                                        _PP_LINKER_FAILURES_KEY, []
+                                    )
+                                )
+                                if self._pp_tracks_linker_failures(self.mbs[next_mb_id])
+                                else None
+                            ),
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
@@ -1151,8 +1163,17 @@ class SchedulerPPMixin:
         return output_result
 
     def _pp_process_batch_result(
-        self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
+        self: Scheduler,
+        batch: ScheduleBatch,
+        output_result: GenerationBatchResult,
+        *,
+        linker_failed_rids: Optional[set[str]] = None,
     ):
+        if self._pp_tracks_linker_failures(batch):
+            self.process_batch_result(
+                batch, output_result, linker_failed_rids=linker_failed_rids or set()
+            )
+            return
         self.process_batch_result(batch, output_result)
 
     def _pp_spec_commit_relayed_accept(
@@ -1492,7 +1513,9 @@ class SchedulerPPMixin:
             target = mbs[next_mb_id]
             if target is None or target.forward_mode.is_prebuilt():
                 return
-            if _pp_can_skip_output_comm(target):
+            track_linker_failures = self._pp_tracks_linker_failures(target)
+            skip_output_comm = _pp_can_skip_output_comm(target)
+            if skip_output_comm and not track_linker_failures:
                 next_pp_outputs, batch_result, d2h_event = (
                     self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
                 )

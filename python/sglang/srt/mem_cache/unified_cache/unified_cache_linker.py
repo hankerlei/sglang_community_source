@@ -196,6 +196,13 @@ class UnifiedCacheLinker(ABC):
         not here.
         """
 
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        """Return a rank-local DFS policy candidate, if the backend has one."""
+        return None
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        """Apply a cross-rank DFS policy, if the backend supports it."""
+
     @abstractmethod
     def start_layer_wise_loading(self) -> int:
         """Start queued loads and return the layer-counter consumer index."""
@@ -303,6 +310,22 @@ class UnifiedCacheLinkerWrapper:
 
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
+
+    def get_local_dfs_health_policy(self) -> tuple[bool, bool] | None:
+        getter = getattr(self.cache_linker, "get_local_dfs_health_policy", None)
+        return getter() if callable(getter) else None
+
+    def apply_dfs_health_policy(self, allow_read: bool, allow_write: bool) -> None:
+        apply_policy = getattr(self.cache_linker, "apply_dfs_health_policy", None)
+        if callable(apply_policy):
+            apply_policy(allow_read, allow_write)
+
+    def has_pending_operations(self) -> bool:
+        return bool(
+            self.inflight_load_rids
+            or self.inflight_load_index >= 0
+            or self.pending_offloads
+        )
 
     # ---- match: probe the remote store and report host_hit_length ----
 
