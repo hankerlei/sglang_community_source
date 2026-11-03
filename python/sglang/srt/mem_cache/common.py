@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
     zero_match_result,
 )
+from sglang.srt.mem_cache.cleanup import run_cleanup_step
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -446,9 +447,19 @@ def discard_kv_cache_backup(
     req.kv.retraction_backup = None
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
+def release_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    *,
+    checkpoint: Optional[bool] = None,
+    is_insert: Optional[bool] = None,
+):
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
+    if is_insert is not None:
+        assert checkpoint is None
+        return _release_aborted_kv_cache(req, tree_cache, is_insert)
+    assert checkpoint is not None
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
@@ -492,6 +503,66 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         tree_cache=tree_cache,
     ).release_row(req)
     req.kv.mark_kv_released()
+
+
+def _release_aborted_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool):
+    """Release an aborted request without repeating completed allocator calls."""
+
+    def snapshot():
+        if not req.kv.holds_kv:
+            return None
+        return req.owned_kv_len(), req.kv.kv_allocated_len
+
+    layout = run_cleanup_step(req, "kv.layout", snapshot)
+    if layout is None:
+        assert tree_cache.supports_mamba()
+        if req.kv.holds_mamba:
+            run_cleanup_step(
+                req,
+                "kv.early_mamba",
+                lambda: kv_storage_of(
+                    tree_cache.req_to_token_pool,
+                    tree_cache.token_to_kv_pool_allocator,
+                ).release_state_slot(req),
+            )
+        return
+
+    owned, allocated = layout
+    if run_cleanup_step(req, "kv.claim", lambda: tree_cache.claim_kv_row(req)):
+        return
+    checkpoint = is_insert and not req.skip_radix_cache_insert
+    if checkpoint:
+        run_cleanup_step(req, "kv.refresh_fill_ids", req.refresh_fill_ids)
+        run_cleanup_step(
+            req, "kv.checkpoint", lambda: tree_cache.checkpoint(req, up_to=owned)
+        )
+    run_cleanup_step(
+        req,
+        "kv.owned",
+        lambda: tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned)]),
+    )
+    run_cleanup_step(req, "kv.unlock", lambda: tree_cache.unlock(req.lock))
+    req.lock = None
+    run_cleanup_step(
+        req,
+        "kv.overallocated",
+        lambda: _release_overallocated_kv_indices(req, owned, allocated, tree_cache),
+    )
+    run_cleanup_step(
+        req,
+        "kv.on_release",
+        lambda: tree_cache.on_release(req, checkpointed=checkpoint),
+    )
+    run_cleanup_step(
+        req,
+        "kv.row",
+        lambda: kv_storage_of(
+            tree_cache.req_to_token_pool,
+            tree_cache.token_to_kv_pool_allocator,
+            tree_cache=tree_cache,
+        ).release_row(req),
+    )
+    run_cleanup_step(req, "kv.mark_released", req.kv.mark_kv_released)
 
 
 def _release_overallocated_kv_indices(

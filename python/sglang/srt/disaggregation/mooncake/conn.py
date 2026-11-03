@@ -7,7 +7,7 @@ import os
 import struct
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.mooncake.source_drain import SourceDrainTracker
 from sglang.srt.disaggregation.mooncake.utils import (
     _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
@@ -316,8 +317,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     "SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S must be positive"
                 )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Abort terminal records must also cover decode's waiting timeout.
+            self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
+            self._source_drain = SourceDrainTracker()
+            self._drained_abort_lock = threading.Lock()
+            self._drained_abort_rooms = OrderedDict()
             # Only the probe loop fills this; empty when the probe is off.
             self.failed_session_probes: Dict[str, FailedSessionProbe] = {}
             # Separate from failed_sessions, which _run_one_probe_pass clears
@@ -394,6 +400,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 t.start()
                 self._worker_threads.append(t)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.prefill_drained_abort_rooms = set()
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_allocator()
@@ -1338,22 +1345,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
     def _await_transfer_futures(self, futures) -> int:
-        """Await a chunk's per-layer RDMA writes; return the first non-zero status.
-        cancel() is a no-op for a running future, so with deferred release on we
-        still drain the running ones before returning (no write may outlive this
-        call, which the drain-ack relies on). Off: original early-return."""
+        """Drain every submitted write, including after failure or cancellation."""
+        futures = tuple(futures)
         ret = 0
+        first_exception = None
         for future in concurrent.futures.as_completed(futures):
             try:
                 status = future.result()
             except concurrent.futures.CancelledError:
                 continue
+            except Exception as exc:
+                if first_exception is None:
+                    first_exception = exc
+                for other in futures:
+                    other.cancel()
+                continue
             if status != 0 and ret == 0:
                 ret = status
-                for f in futures:
-                    f.cancel()
-                if not self.enable_deferred_decode_kv_release:
-                    return ret
+                for other in futures:
+                    other.cancel()
+        if first_exception is not None:
+            raise first_exception
         return ret
 
     def send_kvcache(
@@ -2501,6 +2513,179 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if self.enable_deferred_decode_kv_release:
             self.poison_deferred_ack_room(room)
 
+    def _prune_drained_abort_rooms(self) -> None:
+        now = time.monotonic()
+        while self._drained_abort_rooms:
+            _, deadline = next(iter(self._drained_abort_rooms.items()))
+            if deadline > now and len(self._drained_abort_rooms) <= 4096:
+                break
+            self._drained_abort_rooms.popitem(last=False)
+
+    def finish_drained_abort(self, room: int) -> Set[Tuple[str, int]]:
+        """Replace live room state with a bounded marker for late bootstrap."""
+        with self._drained_abort_lock:
+            targets = {
+                (info.endpoint, info.dst_port)
+                for info in self.transfer_infos.get(room, {}).values()
+                if not info.is_dummy
+            }
+            ttl = max(300, self.bootstrap_timeout, self.waiting_timeout)
+            self._drained_abort_rooms.pop(room, None)
+            self._drained_abort_rooms[room] = time.monotonic() + ttl
+            self._prune_drained_abort_rooms()
+            self.request_status.pop(room, None)
+            self.transfer_infos.pop(room, None)
+            self.req_to_decode_prefix_len.pop(room, None)
+            with self.failure_lock:
+                self.failure_records.pop(room, None)
+            return targets
+
+    def _register_bootstrap_transfer(
+        self,
+        room: int,
+        session_id: str,
+        transfer_info: TransferInfo,
+        required_dst_info_num: int,
+    ) -> None:
+        with self._drained_abort_lock:
+            self._prune_drained_abort_rooms()
+            if room not in self._drained_abort_rooms:
+                infos = self.transfer_infos.setdefault(room, {})
+                infos[session_id] = transfer_info
+                if len(infos) == required_dst_info_num:
+                    self.resolve_kv_replica_factor(infos)
+                    self.req_to_decode_prefix_len[room] = next(
+                        (
+                            info.decode_prefix_len
+                            for info in infos.values()
+                            if info.decode_prefix_len is not None
+                        ),
+                        0,
+                    )
+                    self.update_status(room, KVPoll.WaitingForInput)
+        # Do not hold the scheduler cleanup lock while a PUSH socket blocks.
+        self._notify_drained_abort_target_if_needed(room, transfer_info)
+
+    def _notify_drained_abort_target_if_needed(
+        self, room: int, transfer_info: TransferInfo
+    ) -> bool:
+        with self._drained_abort_lock:
+            self._prune_drained_abort_rooms()
+            terminal = room in self._drained_abort_rooms
+            failed = terminal or self.request_status.get(room) == KVPoll.Failed
+        if (
+            failed
+            and not transfer_info.is_dummy
+            and self.source_transfers_drained(room)
+        ):
+            try:
+                self.sync_status_to_decode_endpoint(
+                    transfer_info.endpoint,
+                    transfer_info.dst_port,
+                    room,
+                    KVPoll.Failed,
+                    self._prefill_unique_rank(),
+                    is_drained_abort=True,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to notify decode endpoint %s:%s of drained abort "
+                    "for room %s",
+                    transfer_info.endpoint,
+                    transfer_info.dst_port,
+                    room,
+                )
+        return terminal
+
+    def sync_status_to_decode_endpoint(
+        self,
+        remote: str,
+        dst_port: int,
+        room: int,
+        status: int,
+        prefill_rank: int,
+        *,
+        is_drained_abort: bool = False,
+    ) -> None:
+        na = NetworkAddress(remote, dst_port)
+        parts = [
+            str(room).encode("ascii"),
+            str(status).encode("ascii"),
+            str(prefill_rank).encode("ascii"),
+        ]
+        if is_drained_abort:
+            parts.append(b"DRAINED_ABORT")
+        self._send_multipart_locked(na.to_tcp(), parts, is_ipv6=na.is_ipv6)
+
+    def _handle_prefill_status_message(self, msg: List[bytes]) -> None:
+        bootstrap_room, status, prefill_rank = msg[:3]
+        bootstrap_room = int(bootstrap_room.decode("ascii"))
+        status = int(status.decode("ascii"))
+        prefill_rank = int(prefill_rank.decode("ascii"))
+        is_drained_abort = (
+            status == KVPoll.Failed and len(msg) == 4 and msg[3] == b"DRAINED_ABORT"
+        )
+
+        if bootstrap_room not in self.request_status:
+            return
+        current_status = self.request_status[bootstrap_room]
+        if current_status == KVPoll.Failed:
+            return
+        # A drained-abort packet arriving after all ranks reported success is
+        # stale; preserve the already completed request. Legacy 3-frame Failed
+        # packets below retain their previous immediate-failure behavior.
+        if current_status == KVPoll.Success and (
+            status == KVPoll.Success or is_drained_abort
+        ):
+            return
+
+        if is_drained_abort:
+            self.prefill_drained_abort_rooms.add(bootstrap_room)
+            self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+            expected_response_num = self.required_prefill_response_num_table[
+                bootstrap_room
+            ]
+            if (
+                len(self.prefill_response_tracker[bootstrap_room])
+                >= expected_response_num
+            ):
+                self.record_failure(
+                    bootstrap_room,
+                    "External KV load failed after prefill transfers drained",
+                )
+                self.update_status(bootstrap_room, KVPoll.Failed)
+            return
+
+        if status == KVPoll.Success:
+            self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+            expected_response_num = self.required_prefill_response_num_table[
+                bootstrap_room
+            ]
+            if (
+                len(self.prefill_response_tracker[bootstrap_room])
+                >= expected_response_num
+            ):
+                if bootstrap_room in self.prefill_drained_abort_rooms:
+                    self.record_failure(
+                        bootstrap_room,
+                        "External KV load failed after prefill transfers drained",
+                    )
+                    self.update_status(bootstrap_room, KVPoll.Failed)
+                    return
+                if self.enable_staging:
+                    handler = self._staging_handler
+                    if handler.is_staging_room(bootstrap_room):
+                        handler.submit_last_scatter_async(bootstrap_room)
+                self.update_status(bootstrap_room, KVPoll.Success)
+        elif status == KVPoll.Failed:
+            # Keep the pre-existing three-frame failure behavior: fail fast.
+            self.prefill_drained_abort_rooms.discard(bootstrap_room)
+            self.record_failure(
+                bootstrap_room,
+                "Failed to get kvcache from prefill instance, it might be dead",
+            )
+            self.update_status(bootstrap_room, status)
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -2575,6 +2760,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
+                    self._source_drain.complete(kv_chunk)
                     continue
 
                 if (
@@ -2902,9 +3088,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # bookkeeping for a subsequent transfer using the same room.
                     self._staging_outstanding.pop(kv_chunk.room, None)
 
+                self._source_drain.complete(kv_chunk)
+
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 if kv_chunk is not None:
+                    self._source_drain.poison(kv_chunk.room)
                     self.poison_deferred_ack_room(kv_chunk.room)
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
@@ -3041,24 +3230,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
-
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
+                    self._register_bootstrap_transfer(
+                        room,
+                        mooncake_session_id,
+                        TransferInfo.from_zmq(waiting_req_bytes),
+                        required_dst_info_num,
                     )
-                    # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.resolve_kv_replica_factor(self.transfer_infos[room])
-                        self.req_to_decode_prefix_len[room] = next(
-                            (
-                                info.decode_prefix_len
-                                for info in self.transfer_infos[room].values()
-                                if info.decode_prefix_len is not None
-                            ),
-                            0,
-                        )
-                        self.update_status(room, KVPoll.WaitingForInput)
 
         t = threading.Thread(target=bootstrap_thread, daemon=True)
         t.start()
@@ -3088,10 +3265,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if self.handle_abort_ack_message(msg):
                     continue
 
+                is_drained_abort = (
+                    len(msg) == 4
+                    and msg[1] == str(KVPoll.Failed).encode("ascii")
+                    and msg[3] == b"DRAINED_ABORT"
+                )
+                if is_drained_abort:
+                    self._handle_prefill_status_message(msg)
+                    continue
+
                 parsed = self.parse_kv_status_message(msg)
                 if parsed is None:
                     continue
                 room, status, prefill_rank, reason = parsed
+                if room in self.prefill_drained_abort_rooms:
+                    self._handle_prefill_status_message(msg)
+                    continue
                 self.apply_prefill_status(
                     bootstrap_room=room,
                     status=status,
@@ -3147,7 +3336,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
+        self._publish_source_chunk(
+            self.transfer_queues[shard_idx],
             TransferKVChunk(
                 room=bootstrap_room,
                 prefill_kv_indices=kv_indices,
@@ -3159,8 +3349,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
                 indices_event=indices_event,
-            )
+            ),
         )
+
+    def _publish_source_chunk(self, queue, chunk):
+        self._source_drain.publish(
+            chunk,
+            queue,
+            lambda: (
+                chunk.room in self.request_status
+                and self.check_status(chunk.room) != KVPoll.Failed
+            ),
+        )
+
+    def source_transfers_drained(self, room):
+        return self._source_drain.drained(room)
 
     def get_session_id(self):
         return self.engine.get_session_id()
@@ -3346,6 +3549,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 class MooncakeKVSender(CommonKVSender):
     supports_host_tensor_indices = True
 
+    def __init__(
+        self,
+        mgr: MooncakeKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
+    ):
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            req_has_disagg_prefill_dp_rank,
+        )
+        self._drained_abort_targets: Set[Tuple[str, int]] = set()
+        self._drained_abort_notified_targets: Set[Tuple[str, int]] = set()
+
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
         self,
@@ -3382,9 +3601,55 @@ class MooncakeKVSender(CommonKVSender):
                     ]
         super()._record_transfer_indices(kv_indices, metric_state_indices)
 
+    def is_transfer_drained(self) -> bool:
+        return self.kv_mgr.source_transfers_drained(self.bootstrap_room)
+
+    def _current_drained_abort_targets(self) -> Set[Tuple[str, int]]:
+        infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})
+        return {
+            (info.endpoint, info.dst_port)
+            for info in list(infos.values())
+            if not info.is_dummy
+        }
+
+    def notify_drained_abort(self) -> None:
+        if self.conclude_state != KVPoll.Failed:
+            return
+        # Publish the tombstone before sending. Failed sends are retried from
+        # the retained target set without resurrecting live room state.
+        self._drained_abort_targets.update(
+            self.kv_mgr.finish_drained_abort(self.bootstrap_room)
+        )
+        for remote, dst_port in (
+            self._drained_abort_targets - self._drained_abort_notified_targets
+        ):
+            self.kv_mgr.sync_status_to_decode_endpoint(
+                remote,
+                dst_port,
+                self.bootstrap_room,
+                KVPoll.Failed,
+                self.kv_mgr._prefill_unique_rank(),
+                is_drained_abort=True,
+            )
+            self._drained_abort_notified_targets.add((remote, dst_port))
+        self.clear()
+
+    def abort(self) -> None:
+        # Serialize failure publication against the final source enqueue.
+        with self.kv_mgr._source_drain.lock:
+            self._drained_abort_targets.update(self._current_drained_abort_targets())
+            super().abort()
+
 
 class MooncakeKVReceiver(CommonKVReceiver):
-    pass
+    def is_drained_abort_ready(self) -> bool:
+        room = self.bootstrap_room
+        if room not in getattr(self.kv_mgr, "prefill_drained_abort_rooms", ()):
+            return False
+        expected = self.kv_mgr.required_prefill_response_num_table.get(room)
+        if expected is None:
+            return False
+        return len(self.kv_mgr.prefill_response_tracker.get(room, ())) >= expected
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):

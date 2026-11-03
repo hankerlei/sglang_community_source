@@ -1423,6 +1423,8 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        self._external_kv_chunked_abort_reqs = {}
+        self._external_kv_abort_rids: Set[str] = set()
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -3974,8 +3976,20 @@ class Scheduler(
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
+        pending = getattr(self, "_external_kv_chunked_abort_reqs", None)
+        if pending is None:
+            pending = self._external_kv_chunked_abort_reqs = {}
         req = self._pending_chunked_abort_req
-        if req is None:
+        if req is not None and (
+            req.external_kv_abort_requested or req.rid in self._external_kv_abort_rids
+        ):
+            req.external_kv_abort_response_via_chunked = True
+            pending[req.rid] = req
+        # A later chunk's abort must not replace the earlier response retry owner.
+        for aborted_req in tuple(pending.values()):
+            self._process_external_kv_chunked_abort(aborted_req)
+        req = self._pending_chunked_abort_req
+        if req is None or req.external_kv_abort_requested or req.rid in pending:
             return
         if self.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
@@ -4013,6 +4027,46 @@ class Scheduler(
             _make_abort_req(req, finished_reason=finished_reason), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
+    def _process_external_kv_chunked_abort(self, req) -> None:
+        if self.chunked_req is req:
+            self.chunked_req = None
+        req.external_kv_abort_response_via_chunked = True
+        sender_terminal = self.prefill_abort_sender_terminal(req)
+        cleanup_done = self.abort_external_kv_request(
+            req,
+            forward_drained=self.prefill_abort_forward_drained(req),
+            sender_terminal=sender_terminal,
+            abort_message=getattr(
+                req.to_finish or req.finished_reason,
+                "message",
+                "External KV load failed",
+            ),
+            is_insert=False,
+            emit_response=False,
+        )
+        if not cleanup_done:
+            return
+        if not req.external_kv_response_sent:
+            try:
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(
+                        rid=req.rid,
+                        finished_reason=req.finished_reason.to_json(),
+                    ),
+                    req,
+                )
+            except Exception:
+                logger.exception(
+                    "Chunked abort response failed for %s; will retry", req.rid
+                )
+                return
+            req.external_kv_response_sent = True
+        self._external_kv_chunked_abort_reqs.pop(req.rid, None)
+        if self._pending_chunked_abort_req is req:
+            self._pending_chunked_abort_req = None
+        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+        return
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -6015,6 +6069,8 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.abort_disagg_prefill_request(chunked_req)
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Abort requests still waiting for encoder embeddings (EPD language-only)
@@ -6572,6 +6628,12 @@ class Scheduler(
         self, schedule_batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         pass
+
+
+def _make_abort_req(
+    req: Req, finished_reason: Optional[FinishReasonDict] = None
+) -> AbortReq:
+    return AbortReq(rid=req.rid, finished_reason=finished_reason)
 
 
 def dispatch_event_loop(scheduler: Scheduler):
