@@ -503,12 +503,16 @@ class FullComponent(TreeComponent):
             slots = storage.take_units(sub_pool, num_tokens)
             if slots is None:
                 return None
-
-            return PoolTransfer(
-                name=PoolName.KV,
-                device_indices=slots.to(torch.int64),
-                keys=list(keys),
-            )
+            try:
+                return PoolTransfer(
+                    name=PoolName.KV,
+                    device_indices=slots.to(torch.int64),
+                    keys=list(keys),
+                )
+            except BaseException:
+                # Not handed to the caller yet, so nobody else can free them.
+                storage.release_taken(sub_pool, slots)
+                raise
 
     def update_external_linker_load(
         self,

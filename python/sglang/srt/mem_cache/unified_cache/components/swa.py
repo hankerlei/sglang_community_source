@@ -1225,10 +1225,15 @@ class SWAComponent(TreeComponent):
             shortfall = max(0, num_tokens - storage.available_units(sub_pool))
             if shortfall:
                 self.cache.evict(EvictParams(swa_num_tokens=shortfall))
-            transfer.device_indices = storage.take_units(sub_pool, num_tokens)
-            if transfer.device_indices is None:
+            slots = storage.take_units(sub_pool, num_tokens)
+            if slots is None:
                 return None
-            transfer.device_indices = transfer.device_indices.to(torch.int64)
+            try:
+                transfer.device_indices = slots.to(torch.int64)
+            except BaseException:
+                # Not handed to the caller yet, so nobody else can free them.
+                storage.release_taken(sub_pool, slots)
+                raise
         return transfer
 
     def update_external_linker_load(

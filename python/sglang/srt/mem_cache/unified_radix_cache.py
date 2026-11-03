@@ -178,6 +178,10 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
+_DFS_POLICY_RETRY_INITIAL_S = 1.0
+_DFS_POLICY_RETRY_MAX_S = 30.0
+_DFS_POLICY_WARNING_INTERVAL_S = 30.0
+
 
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
@@ -553,6 +557,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 storage_extra_config = dict(storage_extra_config or {})
                 storage_extra_config.setdefault(
                     "file_storage_path", server_args.file_storage_path
+                )
+
+            if storage_backend == "mooncake":
+                from sglang.srt.mem_cache.storage.mooncake_store.dfs_health import (
+                    inject_dfs_health_config,
+                )
+
+                # Carry the same resolved CLI/env/default values through the
+                # HiCache backend factory to MooncakeStore.
+                storage_extra_config = inject_dfs_health_config(
+                    storage_extra_config, server_args=server_args
                 )
         storage_prefetch_threshold = (
             self._storage_attachment.resolve_prefetch_threshold(
@@ -3900,6 +3915,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        self._sync_dfs_health_policy()
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [self.linker.num_completed_offloads()],
@@ -3955,6 +3971,92 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+
+    def _sync_dfs_health_policy(self) -> None:
+        """Apply one conservative DFS policy across all attention ranks."""
+        owner = self.linker
+        if owner is None and self.cache_controller is not None:
+            owner = self.cache_controller.storage_backend
+        getter = getattr(owner, "get_local_dfs_health_policy", None)
+        apply_policy = getattr(owner, "apply_dfs_health_policy", None)
+        if not callable(getter) or not callable(apply_policy):
+            return
+        local_policy = getter()
+        if local_policy is None:
+            return
+
+        effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
+        self._all_reduce_attn_groups(effective, torch.distributed.ReduceOp.MIN)
+        if self.pp_size > 1 and self.pp_group is not None:
+            torch.distributed.all_reduce(
+                effective,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.pp_group,
+            )
+        effective_values = effective.tolist()
+        allow_write = bool(effective_values[1])
+        target = (bool(effective_values[0]) and allow_write, allow_write)
+
+        now = time.monotonic()
+        failed_target = getattr(self, "_dfs_policy_failed_target", None)
+        next_retry_at = getattr(self, "_dfs_policy_next_retry_at", 0.0)
+        if failed_target == target and now < next_retry_at:
+            return
+
+        try:
+            apply_policy(*target)
+        except Exception as exc:
+            failures = (
+                getattr(self, "_dfs_policy_consecutive_failures", 0) + 1
+                if failed_target == target
+                else 1
+            )
+            retry_delay = min(
+                _DFS_POLICY_RETRY_INITIAL_S * (2 ** min(failures - 1, 30)),
+                _DFS_POLICY_RETRY_MAX_S,
+            )
+            self._dfs_policy_failed_target = target
+            self._dfs_policy_consecutive_failures = failures
+            self._dfs_policy_next_retry_at = now + retry_delay
+
+            last_warning_at = getattr(
+                self, "_dfs_policy_last_warning_at", float("-inf")
+            )
+            if now - last_warning_at >= _DFS_POLICY_WARNING_INTERVAL_S:
+                suppressed = getattr(self, "_dfs_policy_suppressed_warnings", 0)
+                logger.warning(
+                    "Mooncake DFS policy application failed; retaining the "
+                    "previous policy: target_read=%s target_write=%s "
+                    "failures=%d retry_in_s=%.1f suppressed=%d error=%r",
+                    target[0],
+                    target[1],
+                    failures,
+                    retry_delay,
+                    suppressed,
+                    exc,
+                )
+                self._dfs_policy_last_warning_at = now
+                self._dfs_policy_suppressed_warnings = 0
+            else:
+                self._dfs_policy_suppressed_warnings = (
+                    getattr(self, "_dfs_policy_suppressed_warnings", 0) + 1
+                )
+            return
+
+        failures = getattr(self, "_dfs_policy_consecutive_failures", 0)
+        if failures:
+            logger.info(
+                "Mooncake DFS policy application recovered: "
+                "target_read=%s target_write=%s failures=%d",
+                target[0],
+                target[1],
+                failures,
+            )
+        self._dfs_policy_failed_target = None
+        self._dfs_policy_consecutive_failures = 0
+        self._dfs_policy_next_retry_at = 0.0
+        self._dfs_policy_last_warning_at = float("-inf")
+        self._dfs_policy_suppressed_warnings = 0
 
     def flush_pending_backups(self) -> None:
         """Submit pending D2H backups as a merged operation."""

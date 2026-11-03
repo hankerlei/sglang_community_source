@@ -92,9 +92,11 @@ from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.kv_events import uses_dynamo_format
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import (
+    DAS_PREFETCH_TRACE_ENABLED,
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
     maybe_release_metadata_buffer,
+    trace_disagg_prefill,
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
@@ -3123,6 +3125,13 @@ class Scheduler(
         *,
         mm_input_error: Optional[str] = None,
     ):
+        if DAS_PREFETCH_TRACE_ENABLED:
+            trace_disagg_prefill(
+                "scheduler_dispatch",
+                recv_req.rid,
+                recv_req.bootstrap_room,
+                self.ps.tp_rank,
+            )
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -3659,11 +3668,35 @@ class Scheduler(
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._prefetch_kvcache(req)
-            self.disagg_prefill_bootstrap_queue.add(
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "bootstrap_queue_add_start",
+                    req.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                    queue_size=len(self.disagg_prefill_bootstrap_queue.queue),
+                    pending=getattr(req, "pending_bootstrap", False),
+                )
+            added = self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
-            req.time_stats.set_prefill_bootstrap_queue_entry_time()
+            if DAS_PREFETCH_TRACE_ENABLED:
+                trace_disagg_prefill(
+                    "bootstrap_queue_add_done",
+                    req.rid,
+                    req.bootstrap_room,
+                    self.ps.tp_rank,
+                    added=added,
+                    queue_size=len(self.disagg_prefill_bootstrap_queue.queue),
+                    pending=getattr(req, "pending_bootstrap", False),
+                )
+            if added:
+                req.time_stats.set_prefill_bootstrap_queue_entry_time()
+                if (
+                    self.enable_waiting_queue_dfs_prefetch
+                    or self.enable_hicache_storage
+                ):
+                    self._prefetch_kvcache(req, is_retracted=is_retracted)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
@@ -3974,8 +4007,20 @@ class Scheduler(
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
+        pending = getattr(self, "_external_kv_chunked_abort_reqs", None)
+        if pending is None:
+            pending = self._external_kv_chunked_abort_reqs = {}
         req = self._pending_chunked_abort_req
-        if req is None:
+        if req is not None and (
+            req.external_kv_abort_requested or req.rid in self._external_kv_abort_rids
+        ):
+            req.external_kv_abort_response_via_chunked = True
+            pending[req.rid] = req
+        # A later chunk's abort must not replace the earlier response retry owner.
+        for aborted_req in tuple(pending.values()):
+            self._process_external_kv_chunked_abort(aborted_req)
+        req = self._pending_chunked_abort_req
+        if req is None or req.external_kv_abort_requested or req.rid in pending:
             return
         if self.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
@@ -4013,6 +4058,46 @@ class Scheduler(
             _make_abort_req(req, finished_reason=finished_reason), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
+    def _process_external_kv_chunked_abort(self, req) -> None:
+        if self.chunked_req is req:
+            self.chunked_req = None
+        req.external_kv_abort_response_via_chunked = True
+        sender_terminal = self.prefill_abort_sender_terminal(req)
+        cleanup_done = self.abort_external_kv_request(
+            req,
+            forward_drained=self.prefill_abort_forward_drained(req),
+            sender_terminal=sender_terminal,
+            abort_message=getattr(
+                req.to_finish or req.finished_reason,
+                "message",
+                "External KV load failed",
+            ),
+            is_insert=False,
+            emit_response=False,
+        )
+        if not cleanup_done:
+            return
+        if not req.external_kv_response_sent:
+            try:
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(
+                        rid=req.rid,
+                        finished_reason=req.finished_reason.to_json(),
+                    ),
+                    req,
+                )
+            except Exception:
+                logger.exception(
+                    "Chunked abort response failed for %s; will retry", req.rid
+                )
+                return
+            req.external_kv_response_sent = True
+        self._external_kv_chunked_abort_reqs.pop(req.rid, None)
+        if self._pending_chunked_abort_req is req:
+            self._pending_chunked_abort_req = None
+        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+        return
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -4942,7 +5027,10 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
-        # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
+        # A cache load can publish shared radix entries before the bytes are
+        # ready. Forward waits for that load; early PD reads must defer until
+        # the regular post-forward send, including for another request that
+        # matched the newly published entries as a device hit.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # A load-back submitted in this build may still be writing pages that a
             # later request matched as device prefix; don't early-send them (#44070).
@@ -5386,6 +5474,8 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        *,
+        linker_failed_rids: Optional[set[str]] = None,
     ):
         self.deferred_responses.stream_released()
         # Flush async trace ops here: in overlap mode this CPU work runs while
@@ -5729,6 +5819,12 @@ class Scheduler(
             elif self.enable_lmcache:
                 idle &= not self.tree_cache.has_pending_cache_operations()
 
+            # Wait for asynchronous linker loads and stores to drain.
+            if self.server_args.enable_unified_cache_external_linker:
+                linker = self.tree_cache.linker
+                if linker is not None:
+                    idle &= not linker.has_pending_operations()
+
         return idle
 
     def _pp_microbatches_drained(self) -> bool:
@@ -6015,6 +6111,8 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.abort_disagg_prefill_request(chunked_req)
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Abort requests still waiting for encoder embeddings (EPD language-only)
@@ -6572,6 +6670,12 @@ class Scheduler(
         self, schedule_batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         pass
+
+
+def _make_abort_req(
+    req: Req, finished_reason: Optional[FinishReasonDict] = None
+) -> AbortReq:
+    return AbortReq(rid=req.rid, finished_reason=finished_reason)
 
 
 def dispatch_event_loop(scheduler: Scheduler):

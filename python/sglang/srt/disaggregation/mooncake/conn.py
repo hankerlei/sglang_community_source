@@ -316,6 +316,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     "SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S must be positive"
                 )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Abort terminal records must also cover decode's waiting timeout.
+            self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             # Only the probe loop fills this; empty when the probe is off.
@@ -1338,22 +1340,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
     def _await_transfer_futures(self, futures) -> int:
-        """Await a chunk's per-layer RDMA writes; return the first non-zero status.
-        cancel() is a no-op for a running future, so with deferred release on we
-        still drain the running ones before returning (no write may outlive this
-        call, which the drain-ack relies on). Off: original early-return."""
+        """Drain every submitted write, including after failure or cancellation."""
+        futures = tuple(futures)
         ret = 0
+        first_exception = None
         for future in concurrent.futures.as_completed(futures):
             try:
                 status = future.result()
             except concurrent.futures.CancelledError:
                 continue
+            except Exception as exc:
+                if first_exception is None:
+                    first_exception = exc
+                for other in futures:
+                    other.cancel()
+                continue
             if status != 0 and ret == 0:
                 ret = status
-                for f in futures:
-                    f.cancel()
-                if not self.enable_deferred_decode_kv_release:
-                    return ret
+                for other in futures:
+                    other.cancel()
+        if first_exception is not None:
+            raise first_exception
         return ret
 
     def send_kvcache(
@@ -2501,6 +2508,75 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if self.enable_deferred_decode_kv_release:
             self.poison_deferred_ack_room(room)
 
+    def _handle_prefill_status_message(self, msg: List[bytes]) -> None:
+        bootstrap_room, status, prefill_rank = msg[:3]
+        bootstrap_room = int(bootstrap_room.decode("ascii"))
+        status = int(status.decode("ascii"))
+        prefill_rank = int(prefill_rank.decode("ascii"))
+        is_drained_abort = (
+            status == KVPoll.Failed and len(msg) == 4 and msg[3] == b"DRAINED_ABORT"
+        )
+
+        if bootstrap_room not in self.request_status:
+            return
+        current_status = self.request_status[bootstrap_room]
+        if current_status == KVPoll.Failed:
+            return
+        # A drained-abort packet arriving after all ranks reported success is
+        # stale; preserve the already completed request. Legacy 3-frame Failed
+        # packets below retain their previous immediate-failure behavior.
+        if current_status == KVPoll.Success and (
+            status == KVPoll.Success or is_drained_abort
+        ):
+            return
+
+        if is_drained_abort:
+            self.prefill_drained_abort_rooms.add(bootstrap_room)
+            self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+            expected_response_num = self.required_prefill_response_num_table[
+                bootstrap_room
+            ]
+            if (
+                len(self.prefill_response_tracker[bootstrap_room])
+                >= expected_response_num
+            ):
+                self.record_failure(
+                    bootstrap_room,
+                    "External KV load failed after prefill transfers drained",
+                )
+                self.update_status(bootstrap_room, KVPoll.Failed)
+            return
+
+        if status == KVPoll.Success:
+            self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+            expected_response_num = self.required_prefill_response_num_table[
+                bootstrap_room
+            ]
+            if (
+                len(self.prefill_response_tracker[bootstrap_room])
+                >= expected_response_num
+            ):
+                if bootstrap_room in self.prefill_drained_abort_rooms:
+                    self.record_failure(
+                        bootstrap_room,
+                        "External KV load failed after prefill transfers drained",
+                    )
+                    self.update_status(bootstrap_room, KVPoll.Failed)
+                    return
+                if self.enable_staging:
+                    handler = self._staging_handler
+                    if handler.is_staging_room(bootstrap_room):
+                        handler.submit_last_scatter_async(bootstrap_room)
+                self.update_status(bootstrap_room, KVPoll.Success)
+        elif status == KVPoll.Failed:
+            # Keep the pre-existing three-frame failure behavior: fail fast.
+            self.prefill_drained_abort_rooms.discard(bootstrap_room)
+            self.record_failure(
+                bootstrap_room,
+                "Failed to get kvcache from prefill instance, it might be dead",
+            )
+            self.update_status(bootstrap_room, status)
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -2572,9 +2648,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             thread_finish_flag=True,
                         )
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                    if self._final_poll_enabled:
+                        self._notify_transfer_waiters()
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
+                    self._source_drain.complete(kv_chunk)
                     continue
 
                 if (
@@ -2902,6 +2981,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # bookkeeping for a subsequent transfer using the same room.
                     self._staging_outstanding.pop(kv_chunk.room, None)
 
+                self._source_drain.complete(kv_chunk)
+
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 if kv_chunk is not None:
@@ -2909,6 +2990,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
+                continue
 
     def _handle_abort_notification(self, msg: List[bytes]) -> bool:
         if not msg or msg[0] != ABORT_TAG:
@@ -3147,7 +3229,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
+        self._publish_source_chunk(
+            self.transfer_queues[shard_idx],
             TransferKVChunk(
                 room=bootstrap_room,
                 prefill_kv_indices=kv_indices,
@@ -3159,8 +3242,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
                 indices_event=indices_event,
-            )
+            ),
         )
+
+    def _publish_source_chunk(self, queue, chunk):
+        self._source_drain.publish(
+            chunk,
+            queue,
+            lambda: (
+                chunk.room in self.request_status
+                and self.check_status(chunk.room) != KVPoll.Failed
+            ),
+        )
+
+    def source_transfers_drained(self, room):
+        if self.request_status.get(room) in (None, KVPoll.Failed):
+            # failure_exception() may already have removed request_status.
+            # Also covers abort racing with a worker parking after its status
+            # check. Each scheduler poll wakes any newly parked chunks.
+            self._wake_pd_hidden_ack_waiters(room)
+        return self._source_drain.drained(room)
 
     def get_session_id(self):
         return self.engine.get_session_id()

@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 from weakref import WeakKeyDictionary as WeakKeyDict
 
 import torch
@@ -43,6 +43,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_DFS_POLICY_RETRY_MAX_S = 30.0
+_DFS_POLICY_WARNING_INTERVAL_S = 30.0
+
 
 class DecodeKVCacheOffloadManager:
     """Manage decode-side KV cache offloading lifecycle and operations."""
@@ -53,6 +56,8 @@ class DecodeKVCacheOffloadManager:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_group: torch.distributed.ProcessGroup,
         tree_cache: BasePrefixCache,
+        attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -68,6 +73,13 @@ class DecodeKVCacheOffloadManager:
             )
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        self.attn_cp_group = attn_cp_group
+        self.pp_group = pp_group
+        self._dfs_policy_failed_target = None
+        self._dfs_policy_consecutive_failures = 0
+        self._dfs_policy_next_retry_at = 0.0
+        self._dfs_policy_last_warning_at = float("-inf")
+        self._dfs_policy_suppressed_warnings = 0
 
         hicache_storage_backend_extra_config = {}
         if get_memory().hicache_storage_backend_extra_config:
@@ -256,6 +268,7 @@ class DecodeKVCacheOffloadManager:
     def check_offload_progress(self):
         """Check the progress of offload from device to host and backup from host to storage."""
         cc = self.cache_controller
+        self._sync_dfs_health_policy()
 
         qsizes = torch.tensor(
             [
@@ -272,6 +285,84 @@ class DecodeKVCacheOffloadManager:
         n_write, n_backup = map(int, qsizes.tolist())
         self._check_offload_progress(n_write)
         self._check_backup_progress(n_backup)
+
+    def _sync_dfs_health_policy(self) -> None:
+        """Apply the most conservative decode-side policy across TP/CP/PP."""
+        owner = getattr(self.cache_controller, "storage_backend", None)
+        getter = getattr(owner, "get_local_dfs_health_policy", None)
+        apply_policy = getattr(owner, "apply_dfs_health_policy", None)
+        if not callable(getter) or not callable(apply_policy):
+            return
+        local_policy = getter()
+        if local_policy is None:
+            return
+
+        effective = torch.tensor(local_policy, dtype=torch.int, device="cpu")
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                effective,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+        for group in (self.attn_cp_group, self.pp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.all_reduce(
+                    effective,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=group,
+                )
+        values = effective.tolist()
+        allow_write = bool(values[1])
+        target = (bool(values[0]) and allow_write, allow_write)
+
+        now = time.monotonic()
+        if (
+            self._dfs_policy_failed_target == target
+            and now < self._dfs_policy_next_retry_at
+        ):
+            return
+        try:
+            apply_policy(*target)
+        except Exception as exc:
+            failures = (
+                self._dfs_policy_consecutive_failures + 1
+                if self._dfs_policy_failed_target == target
+                else 1
+            )
+            retry_delay = min(2 ** min(failures - 1, 30), _DFS_POLICY_RETRY_MAX_S)
+            self._dfs_policy_failed_target = target
+            self._dfs_policy_consecutive_failures = failures
+            self._dfs_policy_next_retry_at = now + retry_delay
+            if now - self._dfs_policy_last_warning_at >= _DFS_POLICY_WARNING_INTERVAL_S:
+                logger.warning(
+                    "Decode-side Mooncake DFS policy application failed; retaining "
+                    "the previous policy: target_read=%s target_write=%s failures=%d "
+                    "retry_in_s=%.1f suppressed=%d error=%r",
+                    target[0],
+                    target[1],
+                    failures,
+                    retry_delay,
+                    self._dfs_policy_suppressed_warnings,
+                    exc,
+                )
+                self._dfs_policy_last_warning_at = now
+                self._dfs_policy_suppressed_warnings = 0
+            else:
+                self._dfs_policy_suppressed_warnings += 1
+            return
+
+        if self._dfs_policy_consecutive_failures:
+            logger.info(
+                "Decode-side Mooncake DFS policy application recovered: "
+                "target_read=%s target_write=%s failures=%d",
+                target[0],
+                target[1],
+                self._dfs_policy_consecutive_failures,
+            )
+        self._dfs_policy_failed_target = None
+        self._dfs_policy_consecutive_failures = 0
+        self._dfs_policy_next_retry_at = 0.0
+        self._dfs_policy_suppressed_warnings = 0
 
     def drain_before_retraction(self):
         """Drain offloads, then refuse retraction on every rank if any rank still tracks a D2H copy."""

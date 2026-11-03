@@ -225,6 +225,30 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
+_DAS_PREFETCH_TRACE_ENABLED = os.environ.get(
+    "SGLANG_DAS_PREFETCH_TRACE", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _trace_disagg_prefill_dispatch(event: str, obj: Any) -> None:
+    if not _DAS_PREFETCH_TRACE_ENABLED:
+        return
+    requests = getattr(obj, "batch", None)
+    if requests is None:
+        requests = (obj,)
+    for req in requests:
+        if not isinstance(req, TokenizedGenerateReqInput):
+            continue
+        logger.info(
+            "DAS_PREFETCH_TRACE phase=%s rid=%s bootstrap_room=%s rank=tokenizer "
+            "wall_ns=%d monotonic_ns=%d",
+            event,
+            req.rid if req.rid is not None else "-",
+            req.bootstrap_room if req.bootstrap_room is not None else "-",
+            time.time_ns(),
+            time.monotonic_ns(),
+        )
+
 
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
     watermark = sampling_params.watermark
@@ -279,6 +303,8 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    dispatched: bool = False
+    abort_requested: bool = False
     last_completion_tokens: int = 1
     # The latest stats the scheduler sent; see RequestOutputStats for when.
     request_stats: Optional[RequestOutputStats] = None
@@ -732,12 +758,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
         sock_send(self.send_to_scheduler, obj)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
 
     async def _async_dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
         await async_sock_send(self.send_to_scheduler, obj)
+        if _DAS_PREFETCH_TRACE_ENABLED:
+            _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
 
     def init_running_status(self):
         # Request states
@@ -1986,6 +2020,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             for tokenized_obj in tokenized_objs:
                 self._mark_state_dispatched(tokenized_obj.rid)
             dispatched = True
+            for tokenized_obj in tokenized_objs:
+                state = self.rid_to_state.get(tokenized_obj.rid)
+                if state is not None:
+                    state.dispatched = True
             for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
                 tokenized_obj.time_stats = time_stat
             set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
