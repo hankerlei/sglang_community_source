@@ -103,7 +103,9 @@ def test_abort_marks_room_before_status_publication():
         assert 7 in manager._terminal_bootstrap_rooms
         manager.request_status[7] = KVPoll.Failed
 
-    with patch.object(CommonKVSender, "abort", autospec=True, side_effect=publish_failure):
+    with patch.object(
+        CommonKVSender, "abort", autospec=True, side_effect=publish_failure
+    ):
         sender.abort()
 
     assert manager.request_status[7] == KVPoll.Failed

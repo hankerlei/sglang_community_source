@@ -3001,8 +3001,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         targets.update(
             (info.endpoint, info.dst_port)
             for info in self.transfer_infos.get(room, {}).values()
-            if not info.is_dummy
-            and (info.endpoint, info.dst_port) not in notified
+            if not info.is_dummy and (info.endpoint, info.dst_port) not in notified
         )
         self._prune_terminal_bootstrap_rooms_locked()
 
@@ -3048,9 +3047,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     not transfer_info.is_dummy
                     and target not in self._terminal_bootstrap_notified.get(room, set())
                 ):
-                    self._terminal_bootstrap_targets.setdefault(room, set()).add(
-                        target
-                    )
+                    self._terminal_bootstrap_targets.setdefault(room, set()).add(target)
             else:
                 infos = self.transfer_infos.setdefault(room, {})
                 infos[session_id] = transfer_info
@@ -3415,12 +3412,9 @@ class MooncakeKVSender(CommonKVSender):
 
     def clear(self) -> None:
         manager = self.kv_mgr
-        if (
-            hasattr(manager, "_terminal_bootstrap_lock")
-            and (
-                self.conclude_state == KVPoll.Failed
-                or manager.request_status.get(self.bootstrap_room) == KVPoll.Failed
-            )
+        if hasattr(manager, "_terminal_bootstrap_lock") and (
+            self.conclude_state == KVPoll.Failed
+            or manager.request_status.get(self.bootstrap_room) == KVPoll.Failed
         ):
             with manager._terminal_bootstrap_lock:
                 manager._mark_failed_bootstrap_room_locked(self.bootstrap_room)
