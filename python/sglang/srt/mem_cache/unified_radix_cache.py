@@ -504,9 +504,7 @@ class UnifiedRadixCache(BasePrefixCache):
         for group in groups:
             gathered = [None] * torch.distributed.get_world_size(group=group)
             torch.distributed.all_gather_object(gathered, all_rids, group=group)
-            all_rids = sorted(
-                {rid for rank_rids in gathered for rid in rank_rids}
-            )
+            all_rids = sorted({rid for rank_rids in gathered for rid in rank_rids})
         if not all_rids:
             return {}
 
